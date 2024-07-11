@@ -1,0 +1,342 @@
+[
+  {
+    "sshHost": "10.5.51.59",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/Z35",
+    "remoteDir": "D:/Project/AMR/sfcTemp/Z35",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.59",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/Z36",
+    "remoteDir": "D:/Project/AMR/sfcTemp/Z36",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.65",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/Z37",
+    "remoteDir": "D:/Project/AMR/sfcTemp/Z37",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.65",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/Z43",
+    "remoteDir": "D:/Project/AMR/sfcTemp/Z43",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.13",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/Z39",
+    "remoteDir": "D:/Project/AMR/sfcTemp/Z39",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.13",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/Z38",
+    "remoteDir": "D:/Project/AMR/sfcTemp/Z38",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.25",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/Z30",
+    "remoteDir": "D:/Project/AMR/sfcTemp/Z30",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.25",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/Z34",
+    "remoteDir": "D:/Project/AMR/sfcTemp/Z34",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.29",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/Z42",
+    "remoteDir": "D:/Project/AMR/sfcTemp/Z42",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.29",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/Z43",
+    "remoteDir": "D:/Project/AMR/sfcTemp/Z43",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.42",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/Z32",
+    "remoteDir": "D:/Project/AMR/sfcTemp/Z32",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.42",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/Z33",
+    "remoteDir": "D:/Project/AMR/sfcTemp/Z33",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.49",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/S75",
+    "remoteDir": "D:/Project/AMR/sfcTemp/S75",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.49",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/S77",
+    "remoteDir": "D:/Project/AMR/sfcTemp/S77",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.76",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/S43",
+    "remoteDir": "D:/Project/AMR/sfcTemp/S43",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.76",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/S73",
+    "remoteDir": "D:/Project/AMR/sfcTemp/S73",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.80",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/sfcTemp/S19",
+    "remoteDir": "D:/Project/AMR/sfcTemp/S19",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.59",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/Z37",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/Z37",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.59",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/Z36",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/Z36",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.65",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/Z37",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/Z37",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.65",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/Z43",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/Z43",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.13",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/Z39",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/Z39",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.13",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/Z38",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/Z38",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.25",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/Z30",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/Z30",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.25",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/Z34",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/Z34",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.29",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/Z42",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/Z42",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.29",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/Z43",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/Z43",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.42",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/Z32",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/Z32",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.42",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/Z33",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/Z33",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.49",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/S75",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/S75",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.49",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/S77",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/S77",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.76",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/S43",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/S43",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.76",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/S73",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/S73",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  },
+  {
+    "sshHost": "10.5.51.80",
+    "sshPort": 22,
+    "user": "USI",
+    "password": "Usish@202406",
+    "localDir": "E:/ai_result/S19",
+    "remoteDir": "D:/Project/AMR/Result/TEMP/ai_result_backup/S19",
+    "cron": "*/30 * * * *",
+    "action": "pull"
+  }
+]
