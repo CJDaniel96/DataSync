@@ -38,7 +38,7 @@ The service is configured using a JSON configuration file. The configuration fil
 
 ## Usage
 
-1. *Install Dependencies*: Ensure you have the required dependencies installed. You can use go get to install them.
+1. `Install Dependencies`: Ensure you have the required dependencies installed. You can use go get to install them.
 
 ```sh
 go get github.com/kardianos/service
@@ -47,13 +47,13 @@ go get github.com/robfig/cron/v3
 go get golang.org/x/crypto/ssh
 ```
 
-2. *Build the Project*: Compile the Go code.
+2. `Build the Project`: Compile the Go code.
 
 ```sh
 go build -o data_sync
 ```
 
-3. *Run the Service*: Execute the compiled binary with the configuration file.
+3. `Run the Service`: Execute the compiled binary with the configuration file.
 
 ```sh
 ./data_sync -config=config.json
@@ -61,25 +61,25 @@ go build -o data_sync
 
 ## Code Structure
 
-+ *main.go*: The main entry point of the application.
-+ *data_sync.go*: Contains the core logic for data synchronization.
-+ *config.json*: The configuration file for the service.
++ `main.go`: The main entry point of the application.
++ `data_sync.go`: Contains the core logic for data synchronization.
++ `config.json`: The configuration file for the service.
 
 ## Functions
 
-*syncData*
+`syncData`
 Synchronizes data between the local and remote directories based on the specified action (pull or push).
 
-*pullData*
+`pullData`
 Pulls data from the remote directory to the local directory.
 
-*pushData*
+`pushData`
 Pushes data from the local directory to the remote directory.
 
-*downloadFile*
+`downloadFile`
 Downloads a file from the remote directory to the local directory.
 
-*uploadFile*
+`uploadFile`
 Uploads a file from the local directory to the remote directory.
 
 ## License
