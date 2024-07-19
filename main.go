@@ -86,12 +86,16 @@ func createSSHConfig(user string, password string) *ssh.ClientConfig {
 	}
 }
 
-func connectToSFTPServer(host string, port int, config *ssh.ClientConfig) (*sftp.Client, error) {
+func connectToSSHServer(host string, port int, config *ssh.ClientConfig) (*ssh.Client, error) {
 	addr := fmt.Sprintf("%s:%d", host, port)
 	conn, err := ssh.Dial("tcp", addr, config)
 	if err != nil {
 		return nil, err
 	}
+	return conn, nil
+}
+
+func createNewClinet(conn *ssh.Client) (*sftp.Client, error) {
 	client, err := sftp.NewClient(conn)
 	if err != nil {
 		return nil, err
@@ -246,7 +250,13 @@ func uploadFile(client *sftp.Client, localFilePath, remoteFilePath string) error
 
 func syncFolder(config Config, startDate, endDate string) {
 	configSSH := createSSHConfig(config.User, config.Password)
-	client, err := connectToSFTPServer(config.SSHHost, config.SSHPort, configSSH)
+	conn, err := connectToSSHServer(config.SSHHost, config.SSHPort, configSSH)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	defer conn.Close()
+	client, err := createNewClinet(conn)
 	if err != nil {
 		log.Println(err)
 		return
@@ -302,7 +312,7 @@ func main() {
 		log.Fatal("Failed to get executable path: ", err)
 	}
 	exeDir := filepath.Dir(exePath)
-	configPath := filepath.Join(exeDir, "data_sync_configs.json")
+	configPath := filepath.Join(exeDir, "configs.json")
 	if err := loadConfig(configPath); err != nil {
 		log.Fatal("Failed to load configuration: ", err)
 	}
