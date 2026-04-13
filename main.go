@@ -236,9 +236,9 @@ func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 			return err 
 		}
 
-		remoteFilePath := filepath.Join(remoteDir, file.Name())
+		remoteFilePath := path.Join(remoteDir, file.Name())
 		localFilePath := filepath.Join(localDir, file.Name())
- 
+
 		if file.Mode()&os.ModeSymlink != 0 {
 			log.Printf("[SKIP] 略過符號連結 (pull): %s", remoteFilePath)
 			continue
@@ -299,8 +299,8 @@ func pushData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 		}
 
 		localFilePath := filepath.Join(localDir, file.Name())
-		remoteFilePath := filepath.Join(remoteDir, file.Name())
- 
+		remoteFilePath := path.Join(remoteDir, file.Name())
+
 		if file.Type()&os.ModeSymlink != 0 {
 			log.Printf("[SKIP] 略過符號連結 (push): %s", localFilePath)
 			continue
