@@ -69,30 +69,56 @@ func (p *program) Stop(s service.Service) error {
 	return nil
 }
 
+// dailyRotateWriter 在每次寫入時檢查日期是否已變更，
+// 若跨過午夜則自動切換至新的日期檔名，同時保留 lumberjack 的大小切分能力。
+type dailyRotateWriter struct {
+	mu     sync.Mutex
+	dir    string
+	date   string
+	logger *lumberjack.Logger
+}
+
+func newDailyRotateWriter(dir string) *dailyRotateWriter {
+	today := time.Now().Format("2006-01-02")
+	return &dailyRotateWriter{
+		dir:  dir,
+		date: today,
+		logger: &lumberjack.Logger{
+			Filename:   filepath.Join(dir, "sync_service_"+today+".log"),
+			MaxSize:    10,  // 每個日誌檔最大容量 (單位：MB)
+			MaxBackups: 7,   // 每個日期最多保留幾個輪替檔
+			MaxAge:     30,  // 舊日誌最多保留幾天
+			Compress:   true, // 壓縮舊日誌 (.gz)
+		},
+	}
+}
+
+func (w *dailyRotateWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// 每次寫入前檢查日期，跨日時切換新檔名
+	if today := time.Now().Format("2006-01-02"); today != w.date {
+		w.date = today
+		w.logger.Filename = filepath.Join(w.dir, "sync_service_"+today+".log")
+		_ = w.logger.Rotate() // 關閉舊檔，lumberjack 下次寫入時會建立新檔
+	}
+
+	return w.logger.Write(p)
+}
+
 func setupLogger(exeDir string) {
 	// 1. 定義 log 資料夾的路徑 (在執行檔所在目錄下的 "log" 資料夾)
 	logDir := filepath.Join(exeDir, "log")
- 
+
 	// 2. 檢查並自動建立 log 資料夾
-	// os.MkdirAll 會在資料夾不存在時自動建立，如果已經存在則什麼都不做 (類似 Linux 的 mkdir -p)
-	// 0755 是跨平台通用的資料夾權限設定
 	if err := os.MkdirAll(logDir, 0755); err != nil {
-		// 如果因為權限等問題無法建立資料夾，就在終端機印出錯誤並終止程式
 		log.Fatalf("無法建立 log 資料夾: %v", err)
 	}
- 
-	// 3. 定義日誌檔案的完整路徑 (現在它位於 log 資料夾內)
-	logPath := filepath.Join(logDir, "sync_service.log")
- 
-	// 4. 讓 lumberjack 接管 log 的輸出
-	log.SetOutput(&lumberjack.Logger{
-		Filename:   logPath, // 指向 log/sync_service.log
-		MaxSize:    10,      // 每個日誌檔最大容量 (單位：MB)
-		MaxBackups: 7,       // 最多保留幾個舊的日誌檔
-		MaxAge:     30,      // 舊日誌最多保留幾天
-		Compress:   true,    // 是否壓縮舊日誌 (.gz)
-	})
- 
+
+	// 3. 使用每日切分 writer 接管 log 輸出
+	log.SetOutput(newDailyRotateWriter(logDir))
+
 	// 設定日誌格式：加入日期與時間 (精確到微秒)
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 }
