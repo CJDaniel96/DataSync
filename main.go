@@ -306,6 +306,40 @@ func loadConfig(configPath string) error {
 	return nil
 }
 
+// selectConfigsByHost 篩選出 sshHost 相符的設定，host 為空時回傳全部。
+//
+// 主機名稱以不分大小寫比對 (DNS 名稱本來就不分大小寫)，
+// 因此設定檔寫 "Example.com"、命令列打 "example.com" 也能對上。
+func selectConfigsByHost(all []Config, host string) []Config {
+	if host == "" {
+		return all
+	}
+
+	var matched []Config
+	for _, c := range all {
+		if strings.EqualFold(strings.TrimSpace(c.SSHHost), strings.TrimSpace(host)) {
+			matched = append(matched, c)
+		}
+	}
+	return matched
+}
+
+// availableHosts 回傳設定檔中出現過的 sshHost 清單 (去重並保持原順序)，
+// 供 -host 找不到相符設定時提示使用者。
+func availableHosts(all []Config) []string {
+	seen := make(map[string]bool)
+	var hosts []string
+	for _, c := range all {
+		key := strings.ToLower(strings.TrimSpace(c.SSHHost))
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		hosts = append(hosts, c.SSHHost)
+	}
+	return hosts
+}
+
 func (p *program) run() {
 	defer close(p.done) // 當 run 結束時，通知 Stop 可以放行了
 	log.Println("[INFO] Configs read successfully")
@@ -802,8 +836,9 @@ func main() {
 		svcLogger = l
 	}
 
-	startDate := flag.String("startDate", "", "Start date for data sync")
-	endDate := flag.String("endDate", "", "End date for data sync")
+	startDate := flag.String("startDate", "", "Start date for data sync (YYYY-MM-DD)")
+	endDate := flag.String("endDate", "", "End date for data sync (YYYY-MM-DD)")
+	host := flag.String("host", "", "只同步設定檔中 sshHost 相符的項目；未指定時同步全部")
 	flag.Parse()
 
 	// Load configuration at service start
@@ -854,16 +889,35 @@ func main() {
 		}
 	}
 
+	// -host 只在手動同步模式下有作用。若沒帶日期範圍就會落到服務模式、
+	// 使這個旗標被靜默忽略，因此明確擋下來。
+	if *host != "" && (*startDate == "" || *endDate == "") {
+		startupFatalf("-host 必須搭配 -startDate 與 -endDate 使用 (它只作用於手動同步模式)")
+	}
+
 	if *startDate != "" && *endDate != "" {
-		log.Println("[INFO] 進入手動同步模式，根據指定日期範圍進行同步")
+		// 依 -host 篩選要同步的設定
+		targets := selectConfigsByHost(configs, *host)
+		if len(targets) == 0 {
+			startupFatalf("找不到 sshHost 為 %q 的設定；設定檔中可用的主機: %s",
+				*host, strings.Join(availableHosts(configs), ", "))
+		}
+
+		if *host != "" {
+			log.Printf("[INFO] 進入手動同步模式，僅同步 sshHost=%s (符合的設定共 %d 筆)",
+				*host, len(targets))
+		} else {
+			log.Printf("[INFO] 進入手動同步模式，同步全部 %d 筆設定", len(targets))
+		}
+
 		// === 建立攔截 Ctrl+C 與系統終止訊號的 Context ===
 		// NotifyContext 會在收到 os.Interrupt (Ctrl+C) 或 SIGTERM 時，自動觸發 ctx 的 Cancel
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop() // 確保程式結束時釋放監聽資源
 		// ==============================================
 
-		for _, config := range configs {
-			log.Println("[INFO] 開始手動同步資料夾: ", config.RemoteDir)
+		for _, config := range targets {
+			log.Printf("[INFO] 開始手動同步資料夾: %s (%s)", config.RemoteDir, config.SSHHost)
 			// 將這個帶有中斷保護的 ctx 傳遞進去
 			syncFolder(ctx, config, *startDate, *endDate)
 			// 檢查是否在中途被使用者按 Ctrl+C 中斷了

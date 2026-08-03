@@ -297,6 +297,85 @@ func TestLoadConfig(t *testing.T) {
 	})
 }
 
+func TestSelectConfigsByHost(t *testing.T) {
+	withHost := func(h, remote string) Config {
+		c := validConfig()
+		c.SSHHost = h
+		c.RemoteDir = remote
+		return c
+	}
+	all := []Config{
+		withHost("alpha.example.com", "/a1"),
+		withHost("beta.example.com", "/b1"),
+		withHost("alpha.example.com", "/a2"),
+	}
+
+	t.Run("空字串回傳全部", func(t *testing.T) {
+		if got := selectConfigsByHost(all, ""); len(got) != 3 {
+			t.Errorf("預期 3 筆，實際 %d 筆", len(got))
+		}
+	})
+
+	t.Run("挑出同一主機的多筆設定", func(t *testing.T) {
+		got := selectConfigsByHost(all, "alpha.example.com")
+		if len(got) != 2 {
+			t.Fatalf("預期 2 筆，實際 %d 筆", len(got))
+		}
+		if got[0].RemoteDir != "/a1" || got[1].RemoteDir != "/a2" {
+			t.Errorf("挑出的設定不正確: %+v", got)
+		}
+	})
+
+	t.Run("主機名稱不分大小寫", func(t *testing.T) {
+		if got := selectConfigsByHost(all, "ALPHA.Example.COM"); len(got) != 2 {
+			t.Errorf("預期 2 筆，實際 %d 筆", len(got))
+		}
+	})
+
+	t.Run("前後空白不影響比對", func(t *testing.T) {
+		if got := selectConfigsByHost(all, "  beta.example.com  "); len(got) != 1 {
+			t.Errorf("預期 1 筆，實際 %d 筆", len(got))
+		}
+	})
+
+	t.Run("無相符主機回傳空", func(t *testing.T) {
+		if got := selectConfigsByHost(all, "nope.example.com"); len(got) != 0 {
+			t.Errorf("預期 0 筆，實際 %d 筆", len(got))
+		}
+	})
+
+	t.Run("不做部分比對", func(t *testing.T) {
+		if got := selectConfigsByHost(all, "alpha"); len(got) != 0 {
+			t.Errorf("不應對主機名稱做前綴/子字串比對，實際挑出 %d 筆", len(got))
+		}
+	})
+}
+
+func TestAvailableHosts(t *testing.T) {
+	withHost := func(h string) Config {
+		c := validConfig()
+		c.SSHHost = h
+		return c
+	}
+
+	got := availableHosts([]Config{
+		withHost("beta.example.com"),
+		withHost("alpha.example.com"),
+		withHost("BETA.example.com"), // 大小寫不同視為同一台
+		withHost("alpha.example.com"),
+	})
+
+	want := []string{"beta.example.com", "alpha.example.com"}
+	if len(got) != len(want) {
+		t.Fatalf("預期 %d 台主機，實際 %d 台: %v", len(want), len(got), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("[%d] = %s, 預期 %s (應去重並保持原順序)", i, got[i], want[i])
+		}
+	}
+}
+
 func TestGenerateDateSlice(t *testing.T) {
 	eq := func(t *testing.T, got, want []string) {
 		t.Helper()
