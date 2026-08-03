@@ -298,21 +298,58 @@ func TestLoadConfig(t *testing.T) {
 }
 
 func TestGenerateDateSlice(t *testing.T) {
-	got, err := generateDateSlice("2026-08-01", "2026-08-03")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"2026-08-01", "2026-08-02", "2026-08-03"}
-	if len(got) != len(want) {
-		t.Fatalf("長度 = %d, 預期 %d (%v)", len(got), len(want), got)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("[%d] = %s, 預期 %s", i, got[i], want[i])
+	eq := func(t *testing.T, got, want []string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("長度 = %d, 預期 %d (%v)", len(got), len(want), got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("[%d] = %s, 預期 %s", i, got[i], want[i])
+			}
 		}
 	}
 
-	if _, err := generateDateSlice("not-a-date", "2026-08-03"); err == nil {
-		t.Error("無效日期應回傳錯誤")
-	}
+	t.Run("由新到舊排列", func(t *testing.T) {
+		got, err := generateDateSlice("2026-08-01", "2026-08-03")
+		if err != nil {
+			t.Fatal(err)
+		}
+		eq(t, got, []string{"2026-08-03", "2026-08-02", "2026-08-01"})
+	})
+
+	t.Run("起訖同一天", func(t *testing.T) {
+		got, err := generateDateSlice("2026-08-01", "2026-08-01")
+		if err != nil {
+			t.Fatal(err)
+		}
+		eq(t, got, []string{"2026-08-01"})
+	})
+
+	t.Run("跨月", func(t *testing.T) {
+		got, err := generateDateSlice("2026-07-30", "2026-08-02")
+		if err != nil {
+			t.Fatal(err)
+		}
+		eq(t, got, []string{"2026-08-02", "2026-08-01", "2026-07-31", "2026-07-30"})
+	})
+
+	t.Run("start 晚於 end 回傳空 slice", func(t *testing.T) {
+		got, err := generateDateSlice("2026-08-05", "2026-08-01")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Errorf("預期空 slice，實際為 %v", got)
+		}
+	})
+
+	t.Run("無效日期回傳錯誤", func(t *testing.T) {
+		if _, err := generateDateSlice("not-a-date", "2026-08-03"); err == nil {
+			t.Error("無效的 startDate 應回傳錯誤")
+		}
+		if _, err := generateDateSlice("2026-08-01", "nope"); err == nil {
+			t.Error("無效的 endDate 應回傳錯誤")
+		}
+	})
 }

@@ -387,8 +387,14 @@ func createNewClinet(conn *ssh.Client) (*sftp.Client, error) {
 	return client, nil
 }
 
+// generateDateSlice 產生 [startDate, endDate] 區間內的每一天。
+//
+// 回傳順序為「由新到舊」：同步優先處理最新的日期資料夾，
+// 作業若在中途被中斷 (Ctrl+C、服務停止)，已完成的會是最近期、
+// 通常也最重要的資料。
+//
+// startDate 晚於 endDate 時回傳空 slice。
 func generateDateSlice(startDate, endDate string) ([]string, error) {
-	var dateSlice []string
 	start, err := time.Parse("2006-01-02", startDate)
 	if err != nil {
 		return nil, err
@@ -397,9 +403,12 @@ func generateDateSlice(startDate, endDate string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	for !start.After(end) {
-		dateSlice = append(dateSlice, start.Format("2006-01-02"))
-		start = start.AddDate(0, 0, 1)
+
+	var dateSlice []string
+	// 由 end 往回遞減到 start
+	for !end.Before(start) {
+		dateSlice = append(dateSlice, end.Format("2006-01-02"))
+		end = end.AddDate(0, 0, -1)
 	}
 	return dateSlice, nil
 }
@@ -512,15 +521,12 @@ func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 				continue
 			}
 		} else {
-			remoteFileInfo, err := client.Stat(remoteFilePath)
-			if err != nil {
-				log.Printf("[ERROR] 無法取得遠端檔案資訊 %s: %v", remoteFilePath, err)
-				atomic.AddUint64(failedCount, 1)
-				continue
-			}
-
+			// ReadDir 回傳的 file 本身就是帶 Size/ModTime 的 os.FileInfo，
+			// 不需要再對每個檔案打一次 client.Stat —— 那等於每檔多一次 SFTP
+			// round-trip，檔案數多又跨 WAN 時代價很可觀。
+			// (符號連結已在上面跳過，因此這裡不存在 lstat/stat 語意差異)
 			localFileInfo, statErr := os.Stat(localFilePath)
-			transfer, err := needsTransfer(remoteFileInfo, localFileInfo, statErr)
+			transfer, err := needsTransfer(file, localFileInfo, statErr)
 			if err != nil {
 				log.Printf("[ERROR] 無法取得本地檔案資訊 %s: %v", localFilePath, err)
 				atomic.AddUint64(failedCount, 1)
@@ -550,7 +556,7 @@ func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 				} else {
 					atomic.AddUint64(successCount, 1) // 成功計數 +1
 				}
-			}(remoteFilePath, localFilePath, remoteFileInfo.ModTime())
+			}(remoteFilePath, localFilePath, file.ModTime())
 		}
 	}
 
