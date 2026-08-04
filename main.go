@@ -389,7 +389,9 @@ func createSSHConfig(user string, password string) *ssh.ClientConfig {
 	}
 }
 
-const keepAliveInterval = 30 * time.Second
+// keepAliveInterval 為 KeepAlive 的發送週期。
+// 宣告為 var 而非 const，是為了讓整合測試能縮短週期以驗證連線中斷的處理。
+var keepAliveInterval = 30 * time.Second
 
 // sshConn 綁定一條 SSH 連線與它的存活狀態。
 //
