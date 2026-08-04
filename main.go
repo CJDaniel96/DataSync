@@ -6,12 +6,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -386,31 +389,62 @@ func createSSHConfig(user string, password string) *ssh.ClientConfig {
 	}
 }
 
-func connectToSSHServer(host string, port int, config *ssh.ClientConfig) (*ssh.Client, error) {
-	addr := fmt.Sprintf("%s:%d", host, port)
-	conn, err := ssh.Dial("tcp", addr, config)
+const keepAliveInterval = 30 * time.Second
+
+// sshConn 綁定一條 SSH 連線與它的存活狀態。
+//
+// ctx 衍生自呼叫端傳入的 context，並在以下情形額外被取消:
+//   - KeepAlive 偵測到連線已中斷
+//   - Close() 被呼叫
+//
+// 同步流程一律使用這個 ctx，連線一斷就能立刻收手，
+// 而不是繼續對一條死掉的連線送請求、直到每個操作各自逾時。
+type sshConn struct {
+	client *ssh.Client
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func (c *sshConn) Close() error {
+	c.cancel() // 同時讓 keepAlive goroutine 立即結束，不必等下一個 tick
+	return c.client.Close()
+}
+
+// keepAlive 定期送出 keepalive 請求；一旦失敗就取消 ctx。
+//
+// 舊版只印一行 log 就結束 goroutine，正在進行的同步完全不知情；
+// 且因為固定阻塞在 ticker 上，連線正常關閉後仍會殘留最多一個週期。
+func (c *sshConn) keepAlive() {
+	t := time.NewTicker(keepAliveInterval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return // 連線已關閉或同步已取消
+		case <-t.C:
+			// 送出一個伺服器無法辨識、但會安全忽略的請求
+			if _, _, err := c.client.SendRequest("keepalive@golang.org", true, nil); err != nil {
+				log.Printf("[ERROR] SSH KeepAlive 失敗，連線可能已中斷，中止本次同步: %v", err)
+				c.cancel()
+				return
+			}
+		}
+	}
+}
+
+func connectToSSHServer(ctx context.Context, host string, port int, config *ssh.ClientConfig) (*sshConn, error) {
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	client, err := ssh.Dial("tcp", addr, config)
 	if err != nil {
 		return nil, err
 	}
 
-	// === 加入 SSH KeepAlive 機制 ===
-	go func() {
-		// 每 30 秒發送一次 KeepAlive
-		t := time.NewTicker(30 * time.Second)
-		defer t.Stop()
-		for range t.C {
-			// 發送一個伺服器無法辨識但會安全忽略的請求
-			_, _, err := conn.SendRequest("keepalive@golang.org", true, nil)
-			if err != nil {
-				// 如果發送失敗，通常代表連線已經中斷，退出 Goroutine
-				log.Println("SSH KeepAlive failed, connection might be broken:", err)
-				return
-			}
-		}
-	}()
-	// ===============================
+	connCtx, cancel := context.WithCancel(ctx)
+	c := &sshConn{client: client, ctx: connCtx, cancel: cancel}
+	go c.keepAlive()
 
-	return conn, nil
+	return c, nil
 }
 
 func createNewClinet(conn *ssh.Client) (*sftp.Client, error) {
@@ -453,6 +487,43 @@ const (
 	// 傳輸中的暫存檔副檔名；完成後才 rename 成正式檔名
 	partSuffix = ".part"
 )
+
+// ctxWriter 讓傳輸中的寫入可被 context 中斷。
+//
+// sftp.File.WriteTo 會把 w.Write 的錯誤原樣往上回傳，因此在每個資料塊寫入前
+// 檢查 context 即可讓下載中途停下來。中斷粒度是一個 SFTP 封包 (預設 32 KB)，
+// 對大檔案而言已足夠即時。
+//
+// 包成 writer 而非改寫成分塊複製迴圈，是為了保留 WriteTo 內部的併發讀取。
+type ctxWriter struct {
+	ctx context.Context
+	w   io.Writer
+}
+
+func (cw *ctxWriter) Write(p []byte) (int, error) {
+	if err := cw.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return cw.w.Write(p)
+}
+
+// ctxReader 是上傳方向的對應物，讓 sftp.File.ReadFrom 可被 context 中斷。
+//
+// 必須轉發 Stat()：ReadFrom 會以型別斷言取得來源大小來決定併發寫入的程度，
+// 少了它會判定大小未知而退回單執行緒的循序路徑，白白損失吞吐量。
+type ctxReader struct {
+	ctx context.Context
+	f   *os.File
+}
+
+func (cr *ctxReader) Read(p []byte) (int, error) {
+	if err := cr.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return cr.f.Read(p)
+}
+
+func (cr *ctxReader) Stat() (os.FileInfo, error) { return cr.f.Stat() }
 
 // needsTransfer 判斷來源檔是否需要傳輸到目的地。
 //
@@ -584,7 +655,7 @@ func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 				defer func() { <-sem }()
 
 				// 依據傳輸結果更新計數器
-				if err := downloadFile(client, local, remote, modTime); err != nil {
+				if err := downloadFile(ctx, client, local, remote, modTime); err != nil {
 					log.Printf("[FAIL] 檔案下載失敗 %s: %v", remote, err)
 					atomic.AddUint64(failedCount, 1) // 失敗計數 +1
 				} else {
@@ -666,7 +737,7 @@ func pushData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 				defer func() { <-sem }()
 
 				// 依據傳輸結果更新計數器
-				if err := uploadFile(client, local, remote, modTime); err != nil {
+				if err := uploadFile(ctx, client, local, remote, modTime); err != nil {
 					log.Printf("[FAIL] 檔案上傳失敗 %s: %v", local, err)
 					atomic.AddUint64(failedCount, 1) // 失敗計數 +1
 				} else {
@@ -686,7 +757,7 @@ func pushData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 // 判定「本地較新」而永久跳過 —— 一次失敗即造成靜默且不可恢復的資料損毀。
 //
 // 最後把 mtime 對齊遠端，讓後續比對是以「來源時間」而非「下載時間」為基準。
-func downloadFile(client *sftp.Client, localFilePath, remoteFilePath string, remoteModTime time.Time) error {
+func downloadFile(ctx context.Context, client *sftp.Client, localFilePath, remoteFilePath string, remoteModTime time.Time) error {
 	remoteFile, err := client.Open(remoteFilePath)
 	if err != nil {
 		return err
@@ -707,7 +778,8 @@ func downloadFile(client *sftp.Client, localFilePath, remoteFilePath string, rem
 		os.Remove(tmpPath)
 	}()
 
-	if _, err := remoteFile.WriteTo(localFile); err != nil {
+	// 透過 ctxWriter 寫入，讓傳輸中途可被取消 (服務停止 / Ctrl+C / 連線中斷)
+	if _, err := remoteFile.WriteTo(&ctxWriter{ctx: ctx, w: localFile}); err != nil {
 		return err
 	}
 	// 必須顯式 Close 並檢查錯誤：緩衝資料的寫入失敗只會在這裡浮現
@@ -729,7 +801,7 @@ func downloadFile(client *sftp.Client, localFilePath, remoteFilePath string, rem
 }
 
 // uploadFile 與 downloadFile 對稱：先傳到遠端的 .part，成功後才 rename。
-func uploadFile(client *sftp.Client, localFilePath, remoteFilePath string, localModTime time.Time) error {
+func uploadFile(ctx context.Context, client *sftp.Client, localFilePath, remoteFilePath string, localModTime time.Time) error {
 	localFile, err := os.Open(localFilePath)
 	if err != nil {
 		return err
@@ -750,7 +822,8 @@ func uploadFile(client *sftp.Client, localFilePath, remoteFilePath string, local
 
 	// 用 sftp.File.ReadFrom 而非 localFile.WriteTo：前者才會走 sftp 的
 	// 分塊併發寫入路徑，長距離連線的吞吐量差距明顯。
-	if _, err := remoteFile.ReadFrom(localFile); err != nil {
+	// 包一層 ctxReader 讓傳輸中途可被取消 (ctxReader 有轉發 Stat，併發度不受影響)。
+	if _, err := remoteFile.ReadFrom(&ctxReader{ctx: ctx, f: localFile}); err != nil {
 		return err
 	}
 	if err := remoteFile.Close(); err != nil {
@@ -776,18 +849,22 @@ func uploadFile(client *sftp.Client, localFilePath, remoteFilePath string, local
 
 func syncFolder(ctx context.Context, config Config, startDate, endDate string) {
 	configSSH := createSSHConfig(config.User, config.Password)
-	conn, err := connectToSSHServer(config.SSHHost, config.SSHPort, configSSH)
+	conn, err := connectToSSHServer(ctx, config.SSHHost, config.SSHPort, configSSH)
 	if err != nil {
 		log.Println(err)
 		return
 	}
 	defer conn.Close()
-	client, err := createNewClinet(conn)
+	client, err := createNewClinet(conn.client)
 	if err != nil {
 		log.Println(err)
 		return
 	}
 	defer client.Close()
+
+	// 以下一律使用 conn.ctx 而非傳入的 ctx：除了原本的服務停止 / Ctrl+C，
+	// 連線中斷時 KeepAlive 也會取消它，讓同步立刻收手。
+	syncCtx := conn.ctx
 
 	if startDate != "" && endDate != "" {
 		dates, err := generateDateSlice(startDate, endDate)
@@ -797,11 +874,17 @@ func syncFolder(ctx context.Context, config Config, startDate, endDate string) {
 		}
 
 		for _, date := range dates {
+			// 已取消就別再跑後續日期，否則會逐一失敗刷一堆日誌
+			if err := syncCtx.Err(); err != nil {
+				log.Println("[WARN] 同步已中斷，略過剩餘日期")
+				return
+			}
+
 			remoteDir := path.Join(config.RemoteDir, date)
 			localDir := filepath.Join(config.LocalDir, date)
 			action := config.Action
 			log.Println("Syncing Date:", date)
-			if err := syncData(ctx, client, localDir, remoteDir, action); err != nil {
+			if err := syncData(syncCtx, client, localDir, remoteDir, action); err != nil {
 				log.Println("Failed to sync folder:", err)
 			}
 		}
@@ -809,7 +892,7 @@ func syncFolder(ctx context.Context, config Config, startDate, endDate string) {
 		remoteDir := config.RemoteDir
 		localDir := config.LocalDir
 		action := config.Action
-		if err := syncData(ctx, client, localDir, remoteDir, action); err != nil {
+		if err := syncData(syncCtx, client, localDir, remoteDir, action); err != nil {
 			log.Println("Failed to sync folder:", err)
 		}
 	}

@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -140,6 +144,153 @@ func TestCleanupOldLogs(t *testing.T) {
 		if exists != shouldExist {
 			t.Errorf("%s: 存在=%v, 預期存在=%v", name, exists, shouldExist)
 		}
+	}
+}
+
+// endlessReader 每次 Read 回傳 1 byte，用來模擬進行中的長時間傳輸。
+// 首次被讀取時關閉 started，讓測試能在「確實開始搬資料之後」才取消，
+// 不必輪詢共用欄位 (那本身就是 data race)。
+type endlessReader struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (s *endlessReader) Read(p []byte) (int, error) {
+	s.once.Do(func() { close(s.started) })
+	p[0] = 'x'
+	return 1, nil
+}
+
+func TestCtxWriterStopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var sink bytes.Buffer
+	cw := &ctxWriter{ctx: ctx, w: &sink}
+
+	if _, err := cw.Write([]byte("hello")); err != nil {
+		t.Fatalf("取消前的寫入不應失敗: %v", err)
+	}
+
+	cancel()
+
+	n, err := cw.Write([]byte("world"))
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("取消後應回傳 context.Canceled，實際為 %v", err)
+	}
+	if n != 0 {
+		t.Errorf("取消後不應寫入任何位元組，實際寫入 %d", n)
+	}
+	if sink.String() != "hello" {
+		t.Errorf("取消後的資料仍被寫出: %q", sink.String())
+	}
+}
+
+func TestCtxReaderStopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f, err := os.CreateTemp(t.TempDir(), "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("hello world"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	cr := &ctxReader{ctx: ctx, f: f}
+
+	buf := make([]byte, 5)
+	if _, err := cr.Read(buf); err != nil {
+		t.Fatalf("取消前的讀取不應失敗: %v", err)
+	}
+
+	cancel()
+
+	if _, err := cr.Read(buf); !errors.Is(err, context.Canceled) {
+		t.Errorf("取消後應回傳 context.Canceled，實際為 %v", err)
+	}
+}
+
+// ctxReader 必須保留 Stat()，否則 sftp.File.ReadFrom 會判定來源大小未知
+// 而退回單執行緒的循序寫入路徑，白白損失吞吐量。
+func TestCtxReaderForwardsStat(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString("0123456789"); err != nil {
+		t.Fatal(err)
+	}
+
+	cr := &ctxReader{ctx: context.Background(), f: f}
+
+	// 這正是 sftp.File.ReadFrom 用來取得大小的型別斷言
+	sizer, ok := interface{}(cr).(interface{ Stat() (os.FileInfo, error) })
+	if !ok {
+		t.Fatal("ctxReader 未實作 Stat()，ReadFrom 會退回循序路徑")
+	}
+	info, err := sizer.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 10 {
+		t.Errorf("Stat().Size() = %d, 預期 10", info.Size())
+	}
+}
+
+// 傳輸途中取消時，WriteTo/ReadFrom 應把 context 錯誤往上傳，
+// 而不是靜默地寫出不完整的內容。
+func TestCtxWriterPropagatesThroughCopy(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var sink bytes.Buffer
+	cw := &ctxWriter{ctx: ctx, w: &sink}
+
+	// 複製到一半取消
+	src := &endlessReader{started: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.CopyBuffer(cw, src, make([]byte, 1))
+		done <- err
+	}()
+
+	<-src.started // 確定已開始搬資料後才取消
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("複製應以 context.Canceled 中止，實際為 %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消後複製未在時限內停止")
+	}
+}
+
+// keepAlive 必須在 context 取消時立刻結束。
+//
+// 舊版固定阻塞在 ticker 上，連線關閉後 goroutine 仍會殘留最多一個完整週期
+// (30 秒)；每輪排程都建新連線的情況下會持續累積。
+//
+// 這裡 client 為 nil 也不會 panic —— ctx 已取消，select 會走 Done 分支，
+// 根本不會碰到 client。
+func TestKeepAliveExitsImmediatelyOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &sshConn{ctx: ctx, cancel: cancel}
+
+	done := make(chan struct{})
+	go func() {
+		c.keepAlive()
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("keepAlive 未在取消後立即結束 (KeepAlive 週期為 %v，代表仍卡在 ticker 上)", keepAliveInterval)
 	}
 }
 
