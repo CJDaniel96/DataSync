@@ -819,7 +819,7 @@ func main() {
 	svcConfig := &service.Config{
 		Name:        "DataSyncService",
 		DisplayName: "Data Sync Service",
-		Description: "This service syncs data from remote server to local machine every 30 minutes",
+		Description: "Synchronizes files between local and remote directories over SFTP. Each sync task runs on its own cron schedule defined in configs.json.",
 	}
 
 	prg := &program{}
