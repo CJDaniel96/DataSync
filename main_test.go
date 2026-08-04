@@ -583,3 +583,109 @@ func TestGenerateDateSlice(t *testing.T) {
 		}
 	})
 }
+
+func TestIsRetryable(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"context 取消", context.Canceled, false},
+		{"context 逾時", context.DeadlineExceeded, false},
+		{"檔案不存在", fs.ErrNotExist, false},
+		{"包裝過的檔案不存在", &fs.PathError{Op: "open", Err: fs.ErrNotExist}, false},
+		{"權限不足", fs.ErrPermission, false},
+		{"一般網路錯誤視為暫時性", errors.New("connection reset by peer"), true},
+		{"未知錯誤預設可重試", errors.New("boom"), true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isRetryable(tc.err); got != tc.want {
+				t.Errorf("isRetryable(%v) = %v, 預期 %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTransferWithRetry(t *testing.T) {
+	// 縮短退避時間，避免測試等待數秒
+	origDelay := retryBaseDelay
+	retryBaseDelay = time.Millisecond
+	t.Cleanup(func() { retryBaseDelay = origDelay })
+
+	t.Run("第一次就成功則不重試", func(t *testing.T) {
+		calls := 0
+		err := transferWithRetry(context.Background(), "x", func() error {
+			calls++
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("非預期錯誤: %v", err)
+		}
+		if calls != 1 {
+			t.Errorf("呼叫 %d 次，預期 1 次", calls)
+		}
+	})
+
+	t.Run("暫時性失敗後成功", func(t *testing.T) {
+		calls := 0
+		err := transferWithRetry(context.Background(), "x", func() error {
+			calls++
+			if calls < 3 {
+				return errors.New("connection reset")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("重試後應成功，實際為 %v", err)
+		}
+		if calls != 3 {
+			t.Errorf("呼叫 %d 次，預期 3 次", calls)
+		}
+	})
+
+	t.Run("持續失敗則在達到上限後放棄", func(t *testing.T) {
+		calls := 0
+		err := transferWithRetry(context.Background(), "x", func() error {
+			calls++
+			return errors.New("always fails")
+		})
+		if err == nil {
+			t.Fatal("預期回傳錯誤")
+		}
+		if calls != maxTransferAttempts {
+			t.Errorf("呼叫 %d 次，預期 %d 次", calls, maxTransferAttempts)
+		}
+	})
+
+	t.Run("確定性錯誤不重試", func(t *testing.T) {
+		calls := 0
+		err := transferWithRetry(context.Background(), "x", func() error {
+			calls++
+			return fs.ErrNotExist
+		})
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("應原樣回傳錯誤，實際為 %v", err)
+		}
+		if calls != 1 {
+			t.Errorf("確定性錯誤不應重試，實際呼叫 %d 次", calls)
+		}
+	})
+
+	t.Run("context 取消後不再重試", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		calls := 0
+		err := transferWithRetry(ctx, "x", func() error {
+			calls++
+			cancel() // 傳輸過程中被取消
+			return errors.New("interrupted")
+		})
+		if err == nil {
+			t.Fatal("預期回傳錯誤")
+		}
+		if calls != 1 {
+			t.Errorf("取消後不應重試，實際呼叫 %d 次", calls)
+		}
+	})
+}

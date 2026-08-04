@@ -25,7 +25,7 @@ func TestPullCreatesDirsWithoutWorldWrite(t *testing.T) {
 	local := t.TempDir()
 	writeFile(t, filepath.Join(remote, "sub", "nested", "a.txt"), []byte("x"))
 
-	if err := syncData(conn.ctx, client, local, remote, actionPull); err != nil {
+	if _, err := syncData(conn.ctx, client, local, remote, actionPull); err != nil {
 		t.Fatalf("syncData 失敗: %v", err)
 	}
 

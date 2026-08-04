@@ -68,7 +68,7 @@ func TestPullRoundTrip(t *testing.T) {
 	writeFile(t, filepath.Join(remote, "sub", "b.txt"), []byte("world"))
 	writeFile(t, filepath.Join(remote, "sub", "deep", "c.bin"), bytes.Repeat([]byte{7}, 1<<16))
 
-	if err := syncData(conn.ctx, client, local, remote, actionPull); err != nil {
+	if _, err := syncData(conn.ctx, client, local, remote, actionPull); err != nil {
 		t.Fatalf("syncData 失敗: %v", err)
 	}
 
@@ -99,7 +99,7 @@ func TestPushRoundTrip(t *testing.T) {
 	writeFile(t, filepath.Join(local, "a.txt"), []byte("hello"))
 	writeFile(t, filepath.Join(local, "sub", "b.bin"), bytes.Repeat([]byte{3}, 1<<16))
 
-	if err := syncData(conn.ctx, client, local, remote, actionPush); err != nil {
+	if _, err := syncData(conn.ctx, client, local, remote, actionPush); err != nil {
 		t.Fatalf("syncData 失敗: %v", err)
 	}
 
@@ -124,7 +124,7 @@ func TestPullIsIdempotent(t *testing.T) {
 	local := t.TempDir()
 	writeFile(t, filepath.Join(remote, "a.txt"), []byte("original"))
 
-	if err := syncData(conn.ctx, client, local, remote, actionPull); err != nil {
+	if _, err := syncData(conn.ctx, client, local, remote, actionPull); err != nil {
 		t.Fatalf("第一輪同步失敗: %v", err)
 	}
 
@@ -142,7 +142,7 @@ func TestPullIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := syncData(conn.ctx, client, local, remote, actionPull); err != nil {
+	if _, err := syncData(conn.ctx, client, local, remote, actionPull); err != nil {
 		t.Fatalf("第二輪同步失敗: %v", err)
 	}
 
@@ -170,7 +170,7 @@ func TestPullRepairsTruncatedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := syncData(conn.ctx, client, local, remote, actionPull); err != nil {
+	if _, err := syncData(conn.ctx, client, local, remote, actionPull); err != nil {
 		t.Fatalf("syncData 失敗: %v", err)
 	}
 
@@ -363,7 +363,7 @@ func TestSyncSkipsSymlinks(t *testing.T) {
 		t.Skipf("此環境無法建立符號連結: %v", err)
 	}
 
-	if err := syncData(conn.ctx, client, local, remote, actionPush); err != nil {
+	if _, err := syncData(conn.ctx, client, local, remote, actionPush); err != nil {
 		t.Fatalf("syncData 失敗: %v", err)
 	}
 
@@ -421,12 +421,96 @@ func TestSyncStopsWhenConnectionBreaks(t *testing.T) {
 	srv.breakConnections()
 
 	done := make(chan error, 1)
-	go func() { done <- syncData(conn.ctx, client, local, remote, actionPull) }()
+	go func() { _, err := syncData(conn.ctx, client, local, remote, actionPull); done <- err }()
 
 	select {
 	case <-done:
 		// 有錯誤或無錯誤都可接受，重點是它有結束而非卡住
 	case <-time.After(30 * time.Second):
 		t.Fatal("連線中斷後同步未結束")
+	}
+}
+
+// syncData 必須回報統計數字，讓呼叫端能區分「完全成功」與「大部分失敗」。
+func TestSyncDataReportsStats(t *testing.T) {
+	srv := newTestSFTPServer(t)
+	client, conn := srv.dial(t)
+
+	remote := t.TempDir()
+	local := t.TempDir()
+	for _, n := range []string{"a.txt", "b.txt", "c.txt"} {
+		writeFile(t, filepath.Join(remote, n), []byte(n))
+	}
+
+	stats, err := syncData(conn.ctx, client, local, remote, actionPull)
+	if err != nil {
+		t.Fatalf("syncData 失敗: %v", err)
+	}
+	if stats.Succeeded != 3 || stats.Failed != 0 || stats.Skipped != 0 {
+		t.Errorf("第一輪統計錯誤: %s", stats)
+	}
+
+	// 第二輪全部應被略過 —— 這正是舊版無從得知的資訊
+	stats, err = syncData(conn.ctx, client, local, remote, actionPull)
+	if err != nil {
+		t.Fatalf("第二輪 syncData 失敗: %v", err)
+	}
+	if stats.Succeeded != 0 || stats.Failed != 0 || stats.Skipped != 3 {
+		t.Errorf("第二輪統計錯誤，應全部略過: %s", stats)
+	}
+}
+
+// 有檔案失敗時必須回傳錯誤。
+// 舊版只回傳最上層掃描的錯誤，逐檔案失敗全被吞進日誌，呼叫端看到的是 nil。
+func TestSyncDataReturnsErrorWhenFilesFail(t *testing.T) {
+	// 縮短重試退避，否則失敗的檔案會讓這個測試等上數秒
+	origDelay := retryBaseDelay
+	retryBaseDelay = time.Millisecond
+	t.Cleanup(func() { retryBaseDelay = origDelay })
+
+	srv := newTestSFTPServer(t)
+	client, conn := srv.dial(t)
+
+	remote := t.TempDir()
+	local := t.TempDir()
+	writeFile(t, filepath.Join(remote, "ok.txt"), []byte("fine"))
+	writeFile(t, filepath.Join(remote, "bad.txt"), []byte("will fail"))
+
+	// 讓 bad.txt 的本地路徑先被佔成目錄，使 rename 必定失敗
+	if err := os.MkdirAll(filepath.Join(local, "bad.txt"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(local, "bad.txt", "blocker"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := syncData(conn.ctx, client, local, remote, actionPull)
+	if err == nil {
+		t.Fatalf("有檔案失敗時應回傳錯誤，實際為 nil (統計: %s)", stats)
+	}
+	if stats.Failed == 0 {
+		t.Errorf("失敗計數應大於 0: %s", stats)
+	}
+	if stats.Succeeded == 0 {
+		t.Errorf("成功的檔案仍應被計入: %s", stats)
+	}
+}
+
+// 取消時回傳的錯誤要能被 errors.Is 辨識，
+// 呼叫端才分得出「被中斷」與「真的失敗」。
+func TestSyncDataCancellationIsIdentifiable(t *testing.T) {
+	srv := newTestSFTPServer(t)
+	client, _ := srv.dial(t)
+
+	remote := t.TempDir()
+	local := t.TempDir()
+	writeFile(t, filepath.Join(remote, "a.txt"), []byte("x"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := syncData(ctx, client, local, remote, actionPull)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("取消時的錯誤應可用 errors.Is 辨識，實際為 %v", err)
 	}
 }

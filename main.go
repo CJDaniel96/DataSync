@@ -566,39 +566,138 @@ func acquire(ctx context.Context, sem chan struct{}) error {
 	}
 }
 
-func syncData(ctx context.Context, client *sftp.Client, localDir, remoteDir, action string) error {
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, maxConcurrentTransfers)
-	// === 新增：原子計數器與時間紀錄 ===
-	var successCount, failedCount uint64
-	startTime := time.Now()
-	log.Printf("[INFO] 開始同步作業 | 模式: %s | 來源/目的: %s <-> %s", action, localDir, remoteDir)
-	// ===================================
+// transferCounters 是一次同步作業共用的原子計數器
+type transferCounters struct {
+	succeeded uint64
+	failed    uint64
+	skipped   uint64 // 已是最新、無須傳輸
+}
 
-	var err error
-	if action == actionPull {
-		err = pullData(ctx, client, localDir, remoteDir, &wg, sem, &successCount, &failedCount)
-	} else if action == actionPush {
-		err = pushData(ctx, client, localDir, remoteDir, &wg, sem, &successCount, &failedCount)
-	} else {
-		return fmt.Errorf("invalid action: %s", action)
+func (c *transferCounters) addSucceeded() { atomic.AddUint64(&c.succeeded, 1) }
+func (c *transferCounters) addFailed()    { atomic.AddUint64(&c.failed, 1) }
+func (c *transferCounters) addSkipped()   { atomic.AddUint64(&c.skipped, 1) }
+
+// syncStats 是一次同步作業的結果摘要
+type syncStats struct {
+	Succeeded uint64
+	Failed    uint64
+	Skipped   uint64
+	Duration  time.Duration
+}
+
+func (s syncStats) String() string {
+	return fmt.Sprintf("成功 %d, 失敗 %d, 略過 %d, 耗時 %v",
+		s.Succeeded, s.Failed, s.Skipped, s.Duration)
+}
+
+// syncData 執行一次同步並回傳結果摘要。
+//
+// 舊版只回傳「最上層目錄掃描」的錯誤，逐檔案的失敗全被吞進日誌，
+// 呼叫端無從區分「完全成功」與「1000 個檔案失敗了 999 個」。
+// 現在只要有任何檔案失敗就回傳錯誤，並一併給出統計數字。
+//
+// 因取消而中止時，回傳的錯誤會包住 ctx.Err()，
+// 呼叫端可用 errors.Is(err, context.Canceled) 區分「被中斷」與「真的失敗」。
+func syncData(ctx context.Context, client *sftp.Client, localDir, remoteDir, action string) (syncStats, error) {
+	var wg sync.WaitGroup
+	var counters transferCounters
+	sem := make(chan struct{}, maxConcurrentTransfers)
+	startTime := time.Now()
+
+	log.Printf("[INFO] 開始同步作業 | 模式: %s | 來源/目的: %s <-> %s", action, localDir, remoteDir)
+
+	var scanErr error
+	switch action {
+	case actionPull:
+		scanErr = pullData(ctx, client, localDir, remoteDir, &wg, sem, &counters)
+	case actionPush:
+		scanErr = pushData(ctx, client, localDir, remoteDir, &wg, sem, &counters)
+	default:
+		return syncStats{}, fmt.Errorf("invalid action: %s", action)
 	}
 
 	wg.Wait() // 等待所有併發的檔案傳輸完成
 
-	// === 新增：結束日誌與統計輸出 ===
-	duration := time.Since(startTime)
-	log.Printf("[INFO] 同步作業完成 | 模式: %s | 總耗時: %v", action, duration)
-	log.Printf("[STAT] 本次同步統計 => 成功傳輸: %d 個檔案, 失敗: %d 個檔案",
-		atomic.LoadUint64(&successCount),
-		atomic.LoadUint64(&failedCount))
-	// ===================================
+	stats := syncStats{
+		Succeeded: atomic.LoadUint64(&counters.succeeded),
+		Failed:    atomic.LoadUint64(&counters.failed),
+		Skipped:   atomic.LoadUint64(&counters.skipped),
+		Duration:  time.Since(startTime),
+	}
+	log.Printf("[STAT] 同步作業結束 | 模式: %s | %s", action, stats)
 
-	return err
+	switch {
+	case scanErr != nil:
+		// 掃描階段就中止 (含 context 取消)。用 %w 包住，
+		// 讓呼叫端能以 errors.Is 辨識取消。
+		return stats, fmt.Errorf("同步中止 (%s): %w", stats, scanErr)
+	case stats.Failed > 0:
+		return stats, fmt.Errorf("有 %d 個檔案傳輸失敗 (%s)", stats.Failed, stats)
+	default:
+		return stats, nil
+	}
 }
 
-// 函數簽名加入 successCount 與 failedCount 的指標
-func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir string, wg *sync.WaitGroup, sem chan struct{}, successCount, failedCount *uint64) error {
+// 單一檔案傳輸的最大嘗試次數 (含第一次)
+const maxTransferAttempts = 3
+
+// retryBaseDelay 是重試的基礎延遲，之後以 2 的次方遞增 (1s, 2s)。
+// 宣告為 var 是為了讓測試能縮短等待時間。
+var retryBaseDelay = time.Second
+
+// isRetryable 判斷錯誤是否值得重試。
+//
+// 只重試可能是暫時性的問題 (網路抖動、連線被重置)。
+// 來源檔不存在或權限不足屬於確定性錯誤，重試只是浪費時間與日誌。
+func isRetryable(err error) bool {
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return false
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, fs.ErrPermission):
+		return false
+	default:
+		return true
+	}
+}
+
+// transferWithRetry 以指數退避重試單一檔案的傳輸。
+//
+// 舊版遇到暫時性的網路抖動就直接放棄該檔案，要等下一輪 cron 才會再試；
+// 手動同步模式下則是完全不會再試。
+//
+// context 一旦取消就立即放棄 —— 服務正在關閉時繼續重試只會拖慢關閉，
+// 而連線中斷時 KeepAlive 也會取消 context，因此不會對死連線空轉。
+func transferWithRetry(ctx context.Context, desc string, transfer func() error) error {
+	var err error
+
+	for attempt := 1; attempt <= maxTransferAttempts; attempt++ {
+		if err = transfer(); err == nil {
+			return nil
+		}
+		if ctx.Err() != nil || !isRetryable(err) {
+			return err
+		}
+		if attempt == maxTransferAttempts {
+			break
+		}
+
+		delay := retryBaseDelay << (attempt - 1)
+		log.Printf("[WARN] %s 第 %d/%d 次嘗試失敗，%v 後重試: %v",
+			desc, attempt, maxTransferAttempts, delay, err)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return err
+		}
+	}
+
+	return fmt.Errorf("重試 %d 次後仍失敗: %w", maxTransferAttempts, err)
+}
+
+func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir string, wg *sync.WaitGroup, sem chan struct{}, counters *transferCounters) error {
 	remoteFiles, err := client.ReadDir(remoteDir)
 	if err != nil {
 		return err
@@ -629,9 +728,10 @@ func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 				log.Printf("[ERROR] 無法建立本地目錄 %s: %v", localFilePath, err)
 				continue
 			}
-			// 遞迴時把計數器指標往下傳
-			if err := pullData(ctx, client, localFilePath, remoteFilePath, wg, sem, successCount, failedCount); err != nil {
+			// 遞迴時把計數器往下傳
+			if err := pullData(ctx, client, localFilePath, remoteFilePath, wg, sem, counters); err != nil {
 				log.Printf("[ERROR] 無法讀取遠端目錄 %s: %v", remoteFilePath, err)
+				counters.addFailed()
 				continue
 			}
 		} else {
@@ -643,10 +743,11 @@ func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 			transfer, err := needsTransfer(file, localFileInfo, statErr)
 			if err != nil {
 				log.Printf("[ERROR] 無法取得本地檔案資訊 %s: %v", localFilePath, err)
-				atomic.AddUint64(failedCount, 1)
+				counters.addFailed()
 				continue
 			}
 			if !transfer {
+				counters.addSkipped()
 				continue
 			}
 
@@ -663,12 +764,14 @@ func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				// 依據傳輸結果更新計數器
-				if err := downloadFile(ctx, client, local, remote, modTime); err != nil {
+				err := transferWithRetry(ctx, remote, func() error {
+					return downloadFile(ctx, client, local, remote, modTime)
+				})
+				if err != nil {
 					log.Printf("[FAIL] 檔案下載失敗 %s: %v", remote, err)
-					atomic.AddUint64(failedCount, 1) // 失敗計數 +1
+					counters.addFailed()
 				} else {
-					atomic.AddUint64(successCount, 1) // 成功計數 +1
+					counters.addSucceeded()
 				}
 			}(remoteFilePath, localFilePath, file.ModTime())
 		}
@@ -678,7 +781,7 @@ func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 }
 
 // 函數簽名加入 successCount 與 failedCount 的指標
-func pushData(ctx context.Context, client *sftp.Client, localDir, remoteDir string, wg *sync.WaitGroup, sem chan struct{}, successCount, failedCount *uint64) error {
+func pushData(ctx context.Context, client *sftp.Client, localDir, remoteDir string, wg *sync.WaitGroup, sem chan struct{}, counters *transferCounters) error {
 	localFiles, err := os.ReadDir(localDir)
 	if err != nil {
 		return err
@@ -707,17 +810,20 @@ func pushData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 		if file.IsDir() {
 			if err := client.MkdirAll(remoteFilePath); err != nil {
 				log.Printf("[ERROR] 無法建立遠端目錄 %s: %v", remoteFilePath, err)
+				counters.addFailed()
 				continue
 			}
-			// 遞迴時把計數器指標往下傳
-			if err := pushData(ctx, client, localFilePath, remoteFilePath, wg, sem, successCount, failedCount); err != nil {
+			// 遞迴時把計數器往下傳
+			if err := pushData(ctx, client, localFilePath, remoteFilePath, wg, sem, counters); err != nil {
 				log.Printf("[ERROR] 無法讀取本地目錄 %s: %v", localFilePath, err)
+				counters.addFailed()
 				continue
 			}
 		} else {
 			localFileInfo, err := os.Stat(localFilePath)
 			if err != nil {
 				log.Printf("[ERROR] 無法取得本地檔案資訊 %s: %v", localFilePath, err)
+				counters.addFailed()
 				continue
 			}
 
@@ -727,10 +833,11 @@ func pushData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 				// 連線中斷時 client.Stat 回的是網路錯誤而非 ENOENT，
 				// 舊版會在此對 nil 解引用而讓整個服務 panic。
 				log.Printf("[ERROR] 無法取得遠端檔案資訊 %s: %v", remoteFilePath, err)
-				atomic.AddUint64(failedCount, 1)
+				counters.addFailed()
 				continue
 			}
 			if !transfer {
+				counters.addSkipped()
 				continue
 			}
 
@@ -745,12 +852,14 @@ func pushData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				// 依據傳輸結果更新計數器
-				if err := uploadFile(ctx, client, local, remote, modTime); err != nil {
+				err := transferWithRetry(ctx, local, func() error {
+					return uploadFile(ctx, client, local, remote, modTime)
+				})
+				if err != nil {
 					log.Printf("[FAIL] 檔案上傳失敗 %s: %v", local, err)
-					atomic.AddUint64(failedCount, 1) // 失敗計數 +1
+					counters.addFailed()
 				} else {
-					atomic.AddUint64(successCount, 1) // 成功計數 +1
+					counters.addSucceeded()
 				}
 			}(localFilePath, remoteFilePath, localFileInfo.ModTime())
 		}
@@ -893,16 +1002,16 @@ func syncFolder(ctx context.Context, config Config, startDate, endDate string) {
 			localDir := filepath.Join(config.LocalDir, date)
 			action := config.Action
 			log.Println("Syncing Date:", date)
-			if err := syncData(syncCtx, client, localDir, remoteDir, action); err != nil {
-				log.Println("Failed to sync folder:", err)
+			if _, err := syncData(syncCtx, client, localDir, remoteDir, action); err != nil {
+				log.Printf("[ERROR] 日期 %s 同步未完全成功: %v", date, err)
 			}
 		}
 	} else {
 		remoteDir := config.RemoteDir
 		localDir := config.LocalDir
 		action := config.Action
-		if err := syncData(syncCtx, client, localDir, remoteDir, action); err != nil {
-			log.Println("Failed to sync folder:", err)
+		if _, err := syncData(syncCtx, client, localDir, remoteDir, action); err != nil {
+			log.Printf("[ERROR] 同步未完全成功 (%s): %v", config.RemoteDir, err)
 		}
 	}
 }
