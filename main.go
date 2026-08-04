@@ -488,6 +488,13 @@ const (
 	maxConcurrentTransfers = 10
 	// 傳輸中的暫存檔副檔名；完成後才 rename 成正式檔名
 	partSuffix = ".part"
+	// 同步過程建立本地目錄時的權限。
+	//
+	// 舊版用 os.ModePerm (0777)，會讓同步下來的目錄變成任何使用者都可寫入。
+	// 實際結果會再被 umask 遮罩，所以在 umask 022 的環境下看起來沒差別，
+	// 但服務以 umask 0 執行時 (部分 service manager、容器映像) 就會真的
+	// 建出 world-writable 的目錄。與 log 資料夾採用同一組權限。
+	syncDirPerm = 0755
 )
 
 // ctxWriter 讓傳輸中的寫入可被 context 中斷。
@@ -618,7 +625,7 @@ func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 		}
 
 		if file.IsDir() {
-			if err := os.MkdirAll(localFilePath, os.ModePerm); err != nil {
+			if err := os.MkdirAll(localFilePath, syncDirPerm); err != nil {
 				log.Printf("[ERROR] 無法建立本地目錄 %s: %v", localFilePath, err)
 				continue
 			}
