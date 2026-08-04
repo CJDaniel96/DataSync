@@ -196,10 +196,13 @@ go build -o data_sync.exe
 ### 專案結構
 
 ```
-main.go        程式全部的實作
-main_test.go   單元測試
-configs.json   設定檔（不納入版控，需自行建立）
-log/           執行時自動產生
+main.go              程式全部的實作
+main_test.go         單元測試（設定驗證、日期範圍、日誌清理、context 包裝）
+integration_test.go  整合測試（實際的 pull/push 傳輸行為）
+sftpserver_test.go   測試用的 in-process SSH + SFTP 伺服器
+perm_unix_test.go    目錄權限測試（僅 Unix，需要 syscall.Umask）
+configs.json         設定檔（不納入版控，需自行建立）
+log/                 執行時自動產生
 ```
 
 ### 測試
@@ -207,6 +210,9 @@ log/           執行時自動產生
 ```bash
 go test -race ./...
 ```
+
+整合測試會在同一個行程內啟動一台 SSH + SFTP 伺服器，實際跑完整的傳輸流程，
+**不需要任何外部環境或設定**。
 
 ## License
 
