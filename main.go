@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/fs"
 	"log"
@@ -42,6 +43,10 @@ type Config struct {
 	RemoteDir string `json:"remoteDir"`
 	Cron      string `json:"cron"`
 	Action    string `json:"action"`
+	// SyncDays > 0 時，排程模式只同步最近 N 天的日期子資料夾
+	// (localDir/<日期> ↔ remoteDir/<日期>)，含今天往回數 N 天。
+	// 0 (預設) 表示同步整個 localDir ↔ remoteDir。
+	SyncDays int `json:"syncDays"`
 }
 
 // Validate 檢查單筆同步設定是否合法。
@@ -72,6 +77,9 @@ func (c Config) Validate() error {
 	if c.Action != actionPull && c.Action != actionPush {
 		problems = append(problems, fmt.Sprintf("action %q 無效，必須是 %q 或 %q",
 			c.Action, actionPull, actionPush))
+	}
+	if c.SyncDays < 0 {
+		problems = append(problems, fmt.Sprintf("syncDays %d 不可為負數 (0 表示同步整個目錄)", c.SyncDays))
 	}
 
 	// 用 cron.ParseStandard 驗證：這正是 cron.New() 預設採用的解析器，
@@ -327,6 +335,17 @@ func selectConfigsByHost(all []Config, host string) []Config {
 	return matched
 }
 
+// countConfigsWithSyncDays 回傳有設定 syncDays 的筆數。
+func countConfigsWithSyncDays(all []Config) int {
+	n := 0
+	for _, c := range all {
+		if c.SyncDays > 0 {
+			n++
+		}
+	}
+	return n
+}
+
 // availableHosts 回傳設定檔中出現過的 sshHost 清單 (去重並保持原順序)，
 // 供 -host 找不到相符設定時提示使用者。
 func availableHosts(all []Config) []string {
@@ -343,6 +362,70 @@ func availableHosts(all []Config) []string {
 	return hosts
 }
 
+// maxStaggerDelay 是排程錯開的最大幅度。
+const maxStaggerDelay = 5 * time.Minute
+
+// staggerKey 是這筆設定在錯開計算中的識別字串。
+// 同一台主機的不同目錄也要各自錯開，因此三個欄位都納入。
+func (c Config) staggerKey() string {
+	return c.SSHHost + "|" + c.RemoteDir + "|" + c.LocalDir
+}
+
+// scheduleInterval 以連續兩個觸發點推算排程間隔；無法判斷時回傳 0。
+func scheduleInterval(sched cron.Schedule, now time.Time) time.Duration {
+	first := sched.Next(now)
+	if first.IsZero() {
+		return 0
+	}
+	second := sched.Next(first)
+	if second.IsZero() {
+		return 0
+	}
+	return second.Sub(first)
+}
+
+// staggerDelay 依設定內容算出一個固定的起跑延遲，把撞在同一個時間點的任務攤開。
+//
+// 二十幾台主機的 cron 若都寫 `0 * * * *`，整點會同時開出全部連線，
+// 瞬間把頻寬與磁碟 I/O 打滿，結果是每一台都變慢。
+//
+// 用雜湊而非亂數：同一筆設定每次啟動都拿到相同的延遲，日誌時間才有可預期性，
+// 排查問題時也不會每次重啟都換一個時間點。
+func staggerDelay(key string, interval time.Duration) time.Duration {
+	window := maxStaggerDelay
+	// 延遲不能吃掉整個排程間隔：@every 30s 這種高頻排程若延遲 5 分鐘，
+	// 每一輪都會被 SkipIfStillRunning 擋掉而完全不執行。取間隔的一半為上限。
+	if interval > 0 && interval/2 < window {
+		window = interval / 2
+	}
+	if window <= 0 {
+		return 0
+	}
+
+	// 必須用 64 位元雜湊：fnv32 的最大值約 4.3e9，換算成 ns 只有 4.3 秒，
+	// 遠小於 5 分鐘的視窗，取餘數後所有任務都會擠在最前面的幾秒內。
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(key)) // hash.Hash 的 Write 不會回傳錯誤
+	return time.Duration(h.Sum64() % uint64(window))
+}
+
+// sleepCtx 等待 d，期間 ctx 被取消就提前結束。回傳是否等滿。
+//
+// 不用 time.Sleep：服務關閉時不該為了一個還沒開始的排程再等上幾分鐘。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func (p *program) run() {
 	defer close(p.done) // 當 run 結束時，通知 Stop 可以放行了
 	log.Println("[INFO] Configs read successfully")
@@ -350,17 +433,31 @@ func (p *program) run() {
 
 	// 註：Go 1.22 起 range 變數已是每輪獨立，無需再手動複製一份 cfg
 	scheduled := 0
+	now := time.Now()
 	for _, cfg := range configs {
-		// AddFunc 的錯誤必須檢查：cron 字串有問題時，該任務會靜默地永遠不執行。
-		// 設定已在載入時驗證過，正常情況不該走到這裡，但仍不能默默吞掉。
-		if _, err := p.cron.AddFunc(cfg.Cron, func() {
-			log.Println("[INFO] 排程啟動，準備同步資料夾: ", cfg.RemoteDir)
-			// 將 p.ctx 往下傳遞
-			syncFolder(p.ctx, cfg, "", "")
-		}); err != nil {
+		// 排程字串在載入設定時已驗證過，正常情況不該解析失敗，但仍不能默默吞掉 ——
+		// 舊版用 AddFunc 且不檢查錯誤時，出問題的任務會永遠不執行且日誌毫無痕跡。
+		sched, err := cron.ParseStandard(cfg.Cron)
+		if err != nil {
 			log.Printf("[ERROR] 排程註冊失敗，此任務不會執行 (cron=%q, remoteDir=%s): %v",
 				cfg.Cron, cfg.RemoteDir, err)
 			continue
+		}
+
+		delay := staggerDelay(cfg.staggerKey(), scheduleInterval(sched, now))
+		p.cron.Schedule(sched, cron.FuncJob(func() {
+			// 錯開起跑時間，避免所有任務在同一個時間點一起衝
+			if !sleepCtx(p.ctx, delay) {
+				return
+			}
+			log.Println("[INFO] 排程啟動，準備同步資料夾: ", cfg.RemoteDir)
+			// 將 p.ctx 往下傳遞
+			syncFolder(p.ctx, cfg, "", "")
+		}))
+		if delay > 0 {
+			log.Printf("[INFO] 已註冊排程 %s (cron=%q, 起跑延遲 %v)", cfg.RemoteDir, cfg.Cron, delay)
+		} else {
+			log.Printf("[INFO] 已註冊排程 %s (cron=%q)", cfg.RemoteDir, cfg.Cron)
 		}
 		scheduled++
 	}
@@ -483,9 +580,29 @@ func generateDateSlice(startDate, endDate string) ([]string, error) {
 	return dateSlice, nil
 }
 
+// recentDateSlice 產生「今天往回數 days 天」的日期字串，由新到舊。
+//
+// days=1 只有今天，days=7 是今天加前面 6 天，與 generateDateSlice 一樣含頭尾。
+// days<=0 回傳 nil，代表不套用日期資料夾、同步整個目錄。
+//
+// 用 AddDate 逐日回推而非減去 24h：後者遇到日光節約時間的日子會算出前一天
+// 或同一天，產生重複或缺漏的資料夾名稱。
+func recentDateSlice(now time.Time, days int) []string {
+	if days <= 0 {
+		return nil
+	}
+	dates := make([]string, 0, days)
+	for i := 0; i < days; i++ {
+		dates = append(dates, now.AddDate(0, 0, -i).Format("2006-01-02"))
+	}
+	return dates
+}
+
 const (
-	// 同時進行的檔案傳輸數上限
+	// 單一同步任務同時進行的檔案傳輸數上限
 	maxConcurrentTransfers = 10
+	// 全部同步任務加總的傳輸數上限，見 globalTransferSem
+	maxGlobalTransfers = 32
 	// 傳輸中的暫存檔副檔名；完成後才 rename 成正式檔名
 	partSuffix = ".part"
 	// 同步過程建立本地目錄時的權限。
@@ -566,6 +683,50 @@ func acquire(ctx context.Context, sem chan struct{}) error {
 	}
 }
 
+// globalTransferSem 是跨所有同步任務共用的傳輸名額。
+//
+// maxConcurrentTransfers 是「每個任務」各自的上限，而 cron 的每個 entry 都在
+// 自己的 goroutine 執行 —— 二十幾台主機若排在同一個時間點，會一口氣開出
+// 20 × 10 = 200 條併發傳輸，網路與磁碟被打滿的結果是每一台都變慢。
+// 這道全域號誌把總量壓在 maxGlobalTransfers，讓任務之間互相排隊而非互相拖累。
+//
+// 之所以是套件層變數而非設定項：設定檔的格式是「任務陣列」，沒有放全域設定的
+// 地方，加一層巢狀會破壞既有設定檔的相容性。
+var globalTransferSem = make(chan struct{}, maxGlobalTransfers)
+
+// transferLimiter 同時代表「單一任務」與「全域」兩道名額限制。
+//
+// 取號順序固定是先 task 再 global，所有呼叫端一致，因此不會有互等的死結。
+type transferLimiter struct {
+	task   chan struct{}
+	global chan struct{}
+}
+
+func newTransferLimiter() *transferLimiter {
+	return &transferLimiter{
+		task:   make(chan struct{}, maxConcurrentTransfers),
+		global: globalTransferSem,
+	}
+}
+
+// acquire 依序取得兩道名額。取得 task 之後若因取消而拿不到 global，
+// 必須把 task 的名額還回去，否則該次同步結束時會有名額永遠漏掉。
+func (l *transferLimiter) acquire(ctx context.Context) error {
+	if err := acquire(ctx, l.task); err != nil {
+		return err
+	}
+	if err := acquire(ctx, l.global); err != nil {
+		<-l.task
+		return err
+	}
+	return nil
+}
+
+func (l *transferLimiter) release() {
+	<-l.global
+	<-l.task
+}
+
 // transferCounters 是一次同步作業共用的原子計數器
 type transferCounters struct {
 	succeeded uint64
@@ -601,7 +762,7 @@ func (s syncStats) String() string {
 func syncData(ctx context.Context, client *sftp.Client, localDir, remoteDir, action string) (syncStats, error) {
 	var wg sync.WaitGroup
 	var counters transferCounters
-	sem := make(chan struct{}, maxConcurrentTransfers)
+	lim := newTransferLimiter()
 	startTime := time.Now()
 
 	log.Printf("[INFO] 開始同步作業 | 模式: %s | 來源/目的: %s <-> %s", action, localDir, remoteDir)
@@ -609,9 +770,9 @@ func syncData(ctx context.Context, client *sftp.Client, localDir, remoteDir, act
 	var scanErr error
 	switch action {
 	case actionPull:
-		scanErr = pullData(ctx, client, localDir, remoteDir, &wg, sem, &counters)
+		scanErr = pullData(ctx, client, localDir, remoteDir, &wg, lim, &counters)
 	case actionPush:
-		scanErr = pushData(ctx, client, localDir, remoteDir, &wg, sem, &counters)
+		scanErr = pushData(ctx, client, localDir, remoteDir, &wg, lim, &counters)
 	default:
 		return syncStats{}, fmt.Errorf("invalid action: %s", action)
 	}
@@ -697,9 +858,19 @@ func transferWithRetry(ctx context.Context, desc string, transfer func() error) 
 	return fmt.Errorf("重試 %d 次後仍失敗: %w", maxTransferAttempts, err)
 }
 
-func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir string, wg *sync.WaitGroup, sem chan struct{}, counters *transferCounters) error {
+func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir string, wg *sync.WaitGroup, lim *transferLimiter, counters *transferCounters) error {
 	remoteFiles, err := client.ReadDir(remoteDir)
 	if err != nil {
+		return err
+	}
+
+	// 目的地的最上層目錄也要自己建：舊版只在遞迴時替「掃到的子目錄」建目錄，
+	// 最上層則假設已經存在 —— 日期資料夾模式下這代表每一天都得先手動建好本地
+	// 資料夾，否則該日的每個檔案都會以 no such file or directory 失敗。
+	//
+	// 順序刻意放在 ReadDir 之後：先建目錄的話，遠端還沒產生的日期會在本地留下
+	// 一堆空資料夾。
+	if err := os.MkdirAll(localDir, syncDirPerm); err != nil {
 		return err
 	}
 
@@ -729,7 +900,7 @@ func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 				continue
 			}
 			// 遞迴時把計數器往下傳
-			if err := pullData(ctx, client, localFilePath, remoteFilePath, wg, sem, counters); err != nil {
+			if err := pullData(ctx, client, localFilePath, remoteFilePath, wg, lim, counters); err != nil {
 				log.Printf("[ERROR] 無法讀取遠端目錄 %s: %v", remoteFilePath, err)
 				counters.addFailed()
 				continue
@@ -754,7 +925,7 @@ func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 			// 先取號、再開 goroutine：號誌限制的必須是「實際存在的 goroutine 數」。
 			// 舊版在 goroutine 內部才取號，大目錄會一次生出數十萬個阻塞中的
 			// goroutine，記憶體直接爆掉。
-			if err := acquire(ctx, sem); err != nil {
+			if err := lim.acquire(ctx); err != nil {
 				log.Println("[INFO] 收到中斷訊號，停止派發後續檔案...")
 				return err
 			}
@@ -762,7 +933,7 @@ func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 			wg.Add(1)
 			go func(remote, local string, modTime time.Time) {
 				defer wg.Done()
-				defer func() { <-sem }()
+				defer lim.release()
 
 				err := transferWithRetry(ctx, remote, func() error {
 					return downloadFile(ctx, client, local, remote, modTime)
@@ -781,9 +952,14 @@ func pullData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 }
 
 // 函數簽名加入 successCount 與 failedCount 的指標
-func pushData(ctx context.Context, client *sftp.Client, localDir, remoteDir string, wg *sync.WaitGroup, sem chan struct{}, counters *transferCounters) error {
+func pushData(ctx context.Context, client *sftp.Client, localDir, remoteDir string, wg *sync.WaitGroup, lim *transferLimiter, counters *transferCounters) error {
 	localFiles, err := os.ReadDir(localDir)
 	if err != nil {
+		return err
+	}
+
+	// 與 pullData 對稱：最上層的遠端目錄同樣要自己建立
+	if err := client.MkdirAll(remoteDir); err != nil {
 		return err
 	}
 
@@ -814,7 +990,7 @@ func pushData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 				continue
 			}
 			// 遞迴時把計數器往下傳
-			if err := pushData(ctx, client, localFilePath, remoteFilePath, wg, sem, counters); err != nil {
+			if err := pushData(ctx, client, localFilePath, remoteFilePath, wg, lim, counters); err != nil {
 				log.Printf("[ERROR] 無法讀取本地目錄 %s: %v", localFilePath, err)
 				counters.addFailed()
 				continue
@@ -842,7 +1018,7 @@ func pushData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 			}
 
 			// 先取號、再開 goroutine (原因同 pullData)
-			if err := acquire(ctx, sem); err != nil {
+			if err := lim.acquire(ctx); err != nil {
 				log.Println("[INFO] 收到中斷訊號，停止派發後續檔案...")
 				return err
 			}
@@ -850,7 +1026,7 @@ func pushData(ctx context.Context, client *sftp.Client, localDir, remoteDir stri
 			wg.Add(1)
 			go func(local, remote string, modTime time.Time) {
 				defer wg.Done()
-				defer func() { <-sem }()
+				defer lim.release()
 
 				err := transferWithRetry(ctx, local, func() error {
 					return uploadFile(ctx, client, local, remote, modTime)
@@ -965,7 +1141,25 @@ func uploadFile(ctx context.Context, client *sftp.Client, localFilePath, remoteF
 	return nil
 }
 
+// syncDates 決定這次要同步哪些日期資料夾。
+//
+// 回傳 nil 代表不套用日期資料夾，直接同步 localDir ↔ remoteDir。
+// 手動指定的日期優先於設定檔的 syncDays：前者是使用者當下的明確意圖。
+func syncDates(config Config, startDate, endDate string, now time.Time) ([]string, error) {
+	if startDate != "" && endDate != "" {
+		return generateDateSlice(startDate, endDate)
+	}
+	return recentDateSlice(now, config.SyncDays), nil
+}
+
 func syncFolder(ctx context.Context, config Config, startDate, endDate string) {
+	// 先算日期再連線：日期字串有問題時不必白白建立一次 SSH 連線
+	dates, err := syncDates(config, startDate, endDate, time.Now())
+	if err != nil {
+		log.Println("Failed to generate date slice:", err)
+		return
+	}
+
 	configSSH := createSSHConfig(config.User, config.Password)
 	conn, err := connectToSSHServer(ctx, config.SSHHost, config.SSHPort, configSSH)
 	if err != nil {
@@ -984,34 +1178,36 @@ func syncFolder(ctx context.Context, config Config, startDate, endDate string) {
 	// 連線中斷時 KeepAlive 也會取消它，讓同步立刻收手。
 	syncCtx := conn.ctx
 
-	if startDate != "" && endDate != "" {
-		dates, err := generateDateSlice(startDate, endDate)
-		if err != nil {
-			log.Println("Failed to generate date slice:", err)
+	if len(dates) == 0 {
+		if _, err := syncData(syncCtx, client, config.LocalDir, config.RemoteDir, config.Action); err != nil {
+			log.Printf("[ERROR] 同步未完全成功 (%s): %v", config.RemoteDir, err)
+		}
+		return
+	}
+
+	for _, date := range dates {
+		// 已取消就別再跑後續日期，否則會逐一失敗刷一堆日誌
+		if err := syncCtx.Err(); err != nil {
+			log.Println("[WARN] 同步已中斷，略過剩餘日期")
 			return
 		}
 
-		for _, date := range dates {
-			// 已取消就別再跑後續日期，否則會逐一失敗刷一堆日誌
-			if err := syncCtx.Err(); err != nil {
-				log.Println("[WARN] 同步已中斷，略過剩餘日期")
-				return
-			}
-
-			remoteDir := path.Join(config.RemoteDir, date)
-			localDir := filepath.Join(config.LocalDir, date)
-			action := config.Action
-			log.Println("Syncing Date:", date)
-			if _, err := syncData(syncCtx, client, localDir, remoteDir, action); err != nil {
-				log.Printf("[ERROR] 日期 %s 同步未完全成功: %v", date, err)
-			}
-		}
-	} else {
-		remoteDir := config.RemoteDir
-		localDir := config.LocalDir
-		action := config.Action
-		if _, err := syncData(syncCtx, client, localDir, remoteDir, action); err != nil {
-			log.Printf("[ERROR] 同步未完全成功 (%s): %v", config.RemoteDir, err)
+		remoteDir := path.Join(config.RemoteDir, date)
+		localDir := filepath.Join(config.LocalDir, date)
+		log.Println("Syncing Date:", date)
+		_, err := syncData(syncCtx, client, localDir, remoteDir, config.Action)
+		switch {
+		case err == nil:
+		case errors.Is(err, fs.ErrNotExist):
+			// 來源的日期資料夾還不存在。syncDays 每小時跑一輪時，今天的資料夾
+			// 在當天稍早本來就可能尚未產生 —— 這是正常狀態，記成 ERROR 會讓
+			// 每台主機每小時都刷一行假錯誤。
+			//
+			// 只有「最上層那次 ReadDir」的錯誤會傳到這裡 (子目錄與個別檔案的
+			// 失敗都併進統計)，因此不會誤把真正的傳輸失敗吞掉。
+			log.Printf("[SKIP] 日期 %s 的來源資料夾不存在，略過", date)
+		default:
+			log.Printf("[ERROR] 日期 %s 同步未完全成功: %v", date, err)
 		}
 	}
 }
@@ -1109,6 +1305,12 @@ func main() {
 				*host, len(targets))
 		} else {
 			log.Printf("[INFO] 進入手動同步模式，同步全部 %d 筆設定", len(targets))
+		}
+
+		// 明確指定的日期會蓋掉設定檔的 syncDays。這是刻意的優先順序，
+		// 但不能默默發生 —— 否則使用者會以為補的是 syncDays 那幾天。
+		if n := countConfigsWithSyncDays(targets); n > 0 {
+			log.Printf("[INFO] 有 %d 筆設定設有 syncDays，本次改以 -startDate/-endDate 指定的範圍為準", n)
 		}
 
 		// === 建立攔截 Ctrl+C 與系統終止訊號的 Context ===

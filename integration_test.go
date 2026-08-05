@@ -5,9 +5,12 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -512,5 +515,201 @@ func TestSyncDataCancellationIsIdentifiable(t *testing.T) {
 	_, err := syncData(ctx, client, local, remote, actionPull)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("取消時的錯誤應可用 errors.Is 辨識，實際為 %v", err)
+	}
+}
+
+// safeBuffer 是可同時被寫入與讀取的 log 目的地。
+// log.Logger 本身有鎖，但測試在讀取內容時仍可能與殘留的背景 goroutine
+// (例如上一個測試的 keepalive) 相撞，因此這裡自己再包一層。
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// captureLog 在測試期間把 log 導向緩衝區，結束後還原。
+func captureLog(t *testing.T) *safeBuffer {
+	t.Helper()
+	original := log.Writer()
+	buf := &safeBuffer{}
+	log.SetOutput(buf)
+	t.Cleanup(func() { log.SetOutput(original) })
+	return buf
+}
+
+// TestSyncFolderSyncDaysLimitsScanRange 驗證 syncDays 只會碰最近 N 天的資料夾。
+//
+// 這正是資料量成長時最關鍵的一項：舊資料夾連掃都不該掃到。
+func TestSyncFolderSyncDaysLimitsScanRange(t *testing.T) {
+	srv := newTestSFTPServer(t)
+
+	remote := t.TempDir()
+	local := t.TempDir()
+
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	yesterday := now.AddDate(0, 0, -1).Format("2006-01-02")
+	old := now.AddDate(0, 0, -10).Format("2006-01-02")
+
+	for _, date := range []string{today, yesterday, old} {
+		writeFile(t, filepath.Join(remote, date, "data.txt"), []byte(date))
+	}
+
+	cfg := srv.config(t, local, remote, actionPull)
+	cfg.SyncDays = 2
+	syncFolder(t.Context(), cfg, "", "")
+
+	for _, date := range []string{today, yesterday} {
+		got := readFile(t, filepath.Join(local, date, "data.txt"))
+		if string(got) != date {
+			t.Errorf("%s 的內容 = %q, 預期 %q", date, got, date)
+		}
+	}
+	if exists(filepath.Join(local, old)) {
+		t.Errorf("%s 超出 syncDays 範圍，不該被同步", old)
+	}
+}
+
+// syncDays 每小時跑一輪時，今天的資料夾在當天稍早本來就可能還沒產生。
+// 這是正常狀態，不該每台主機每小時都刷一行假錯誤。
+func TestSyncFolderSkipsMissingDateFolderQuietly(t *testing.T) {
+	srv := newTestSFTPServer(t)
+
+	remote := t.TempDir()
+	local := t.TempDir()
+
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	yesterday := now.AddDate(0, 0, -1).Format("2006-01-02")
+
+	// 只建立今天的，昨天的資料夾完全不存在
+	writeFile(t, filepath.Join(remote, today, "data.txt"), []byte("ok"))
+
+	logs := captureLog(t)
+	cfg := srv.config(t, local, remote, actionPull)
+	cfg.SyncDays = 2
+	syncFolder(t.Context(), cfg, "", "")
+
+	if got := readFile(t, filepath.Join(local, today, "data.txt")); string(got) != "ok" {
+		t.Errorf("今天的資料未同步: %q", got)
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, "[SKIP]") || !strings.Contains(out, yesterday) {
+		t.Errorf("缺少 %s 不存在的 [SKIP] 記錄，實際日誌:\n%s", yesterday, out)
+	}
+	if strings.Contains(out, "[ERROR]") {
+		t.Errorf("資料夾尚未產生屬正常狀態，不該記成 ERROR，實際日誌:\n%s", out)
+	}
+}
+
+// 真正的失敗仍必須記成 ERROR —— 上面的靜默化不能把問題一併吞掉。
+func TestSyncFolderStillReportsRealFailures(t *testing.T) {
+	srv := newTestSFTPServer(t)
+
+	remote := t.TempDir()
+	local := t.TempDir()
+	today := time.Now().Format("2006-01-02")
+
+	writeFile(t, filepath.Join(remote, today, "data.txt"), []byte("payload"))
+	// 本地把同名路徑佔成檔案，pull 時建立目錄必定失敗
+	writeFile(t, filepath.Join(local, today, "sub"), []byte("blocker"))
+	writeFile(t, filepath.Join(remote, today, "sub", "inner.txt"), []byte("x"))
+
+	logs := captureLog(t)
+	cfg := srv.config(t, local, remote, actionPull)
+	cfg.SyncDays = 1
+	syncFolder(t.Context(), cfg, "", "")
+
+	if out := logs.String(); !strings.Contains(out, "[ERROR]") {
+		t.Errorf("真正的失敗應記成 ERROR，實際日誌:\n%s", out)
+	}
+}
+
+// 手動指定的日期必須蓋過設定檔的 syncDays
+func TestSyncFolderManualDatesOverrideSyncDays(t *testing.T) {
+	srv := newTestSFTPServer(t)
+
+	remote := t.TempDir()
+	local := t.TempDir()
+
+	today := time.Now().Format("2006-01-02")
+	writeFile(t, filepath.Join(remote, today, "recent.txt"), []byte("recent"))
+	writeFile(t, filepath.Join(remote, "2020-01-02", "old.txt"), []byte("old"))
+
+	cfg := srv.config(t, local, remote, actionPull)
+	cfg.SyncDays = 1
+	syncFolder(t.Context(), cfg, "2020-01-02", "2020-01-02")
+
+	if got := readFile(t, filepath.Join(local, "2020-01-02", "old.txt")); string(got) != "old" {
+		t.Errorf("指定日期的資料未同步: %q", got)
+	}
+	if exists(filepath.Join(local, today)) {
+		t.Error("手動模式下不該改用 syncDays 的範圍")
+	}
+}
+
+// 全域號誌壓到 1 時，傳輸仍必須全部完成，且名額不能有殘留 ——
+// 少還一個名額就會讓後續所有同步任務永久少一個併發額度。
+func TestGlobalTransferCapDoesNotLeakSlots(t *testing.T) {
+	withGlobalTransferSem(t, 1)
+
+	srv := newTestSFTPServer(t)
+	client, conn := srv.dial(t)
+
+	remote := t.TempDir()
+	local := t.TempDir()
+
+	const fileCount = 20
+	for i := 0; i < fileCount; i++ {
+		writeFile(t, filepath.Join(remote, "f"+strconv.Itoa(i)+".txt"), []byte(strconv.Itoa(i)))
+	}
+
+	stats, err := syncData(conn.ctx, client, local, remote, actionPull)
+	if err != nil {
+		t.Fatalf("syncData 失敗: %v", err)
+	}
+	if stats.Succeeded != fileCount {
+		t.Errorf("成功數 = %d, 預期 %d", stats.Succeeded, fileCount)
+	}
+	if n := len(globalTransferSem); n != 0 {
+		t.Errorf("全域號誌殘留 %d 個名額，應已全部歸還", n)
+	}
+}
+
+// push 方向的日期資料夾同樣要能自己建立遠端目錄
+func TestSyncFolderSyncDaysPush(t *testing.T) {
+	srv := newTestSFTPServer(t)
+
+	remote := t.TempDir()
+	local := t.TempDir()
+
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	old := now.AddDate(0, 0, -10).Format("2006-01-02")
+
+	writeFile(t, filepath.Join(local, today, "data.txt"), []byte("today"))
+	writeFile(t, filepath.Join(local, old, "data.txt"), []byte("old"))
+
+	cfg := srv.config(t, local, remote, actionPush)
+	cfg.SyncDays = 1
+	syncFolder(t.Context(), cfg, "", "")
+
+	if got := readFile(t, filepath.Join(remote, today, "data.txt")); string(got) != "today" {
+		t.Errorf("今天的資料未上傳: %q", got)
+	}
+	if exists(filepath.Join(remote, old)) {
+		t.Errorf("%s 超出 syncDays 範圍，不該被同步", old)
 	}
 }

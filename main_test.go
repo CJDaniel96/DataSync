@@ -8,10 +8,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/robfig/cron/v3"
 )
 
 // fakeInfo 只實作比對邏輯會用到的欄位
@@ -312,6 +315,15 @@ func TestConfigValidate(t *testing.T) {
 		t.Fatalf("合法設定不應回傳錯誤: %v", err)
 	}
 
+	// syncDays 省略 (0) 與正整數都是合法的
+	for _, days := range []int{0, 1, 7, 365} {
+		c := validConfig()
+		c.SyncDays = days
+		if err := c.Validate(); err != nil {
+			t.Errorf("syncDays %d 應為合法: %v", days, err)
+		}
+	}
+
 	// cron descriptor 也必須被接受 (cron.New 預設解析器支援)
 	for _, expr := range []string{"@every 30m", "@daily", "*/15 * * * *"} {
 		c := validConfig()
@@ -338,6 +350,7 @@ func TestConfigValidate(t *testing.T) {
 		{"空的 cron", func(c *Config) { c.Cron = "" }, "cron"},
 		{"cron 欄位數不足", func(c *Config) { c.Cron = "0 *" }, "cron"},
 		{"cron 內容無意義", func(c *Config) { c.Cron = "every hour" }, "cron"},
+		{"syncDays 為負數", func(c *Config) { c.SyncDays = -1 }, "syncDays"},
 	}
 
 	for _, tc := range tests {
@@ -580,6 +593,394 @@ func TestGenerateDateSlice(t *testing.T) {
 		}
 		if _, err := generateDateSlice("2026-08-01", "nope"); err == nil {
 			t.Error("無效的 endDate 應回傳錯誤")
+		}
+	})
+}
+
+func TestRecentDateSlice(t *testing.T) {
+	// 2026-08-05 是個平常的日子；跨月與跨年的邊界另外測
+	now := time.Date(2026, 8, 5, 13, 45, 0, 0, time.Local)
+
+	eq := func(t *testing.T, got, want []string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("長度 = %d, 預期 %d (%v)", len(got), len(want), got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("[%d] = %s, 預期 %s", i, got[i], want[i])
+			}
+		}
+	}
+
+	t.Run("days=0 表示不套用日期資料夾", func(t *testing.T) {
+		if got := recentDateSlice(now, 0); got != nil {
+			t.Errorf("預期 nil，實際為 %v", got)
+		}
+	})
+
+	t.Run("負數同樣視為未啟用", func(t *testing.T) {
+		if got := recentDateSlice(now, -3); got != nil {
+			t.Errorf("預期 nil，實際為 %v", got)
+		}
+	})
+
+	t.Run("days=1 只有今天", func(t *testing.T) {
+		eq(t, recentDateSlice(now, 1), []string{"2026-08-05"})
+	})
+
+	t.Run("由新到舊且含頭尾", func(t *testing.T) {
+		eq(t, recentDateSlice(now, 3), []string{"2026-08-05", "2026-08-04", "2026-08-03"})
+	})
+
+	t.Run("跨月", func(t *testing.T) {
+		aug2 := time.Date(2026, 8, 2, 0, 30, 0, 0, time.Local)
+		eq(t, recentDateSlice(aug2, 4), []string{"2026-08-02", "2026-08-01", "2026-07-31", "2026-07-30"})
+	})
+
+	t.Run("跨年", func(t *testing.T) {
+		jan1 := time.Date(2026, 1, 1, 23, 59, 0, 0, time.Local)
+		eq(t, recentDateSlice(jan1, 2), []string{"2026-01-01", "2025-12-31"})
+	})
+
+	t.Run("不會產生重複或缺漏的日期", func(t *testing.T) {
+		// 用 AddDate 而非減 24h 的理由：日光節約時間的日子若用後者，
+		// 會算出重複的日期。這裡直接檢查「連續 400 天皆相異且遞減」。
+		got := recentDateSlice(now, 400)
+		if len(got) != 400 {
+			t.Fatalf("長度 = %d, 預期 400", len(got))
+		}
+		seen := make(map[string]bool, len(got))
+		for i, d := range got {
+			if seen[d] {
+				t.Fatalf("[%d] 日期重複: %s", i, d)
+			}
+			seen[d] = true
+			if i > 0 && got[i-1] <= d {
+				t.Fatalf("[%d] 順序有誤: %s 應早於 %s", i, d, got[i-1])
+			}
+		}
+	})
+}
+
+func TestSyncDates(t *testing.T) {
+	now := time.Date(2026, 8, 5, 9, 0, 0, 0, time.Local)
+
+	t.Run("未設 syncDays 也未給日期時同步整個目錄", func(t *testing.T) {
+		got, err := syncDates(validConfig(), "", "", now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != nil {
+			t.Errorf("預期 nil (不套用日期資料夾)，實際為 %v", got)
+		}
+	})
+
+	t.Run("排程模式套用 syncDays", func(t *testing.T) {
+		c := validConfig()
+		c.SyncDays = 2
+		got, err := syncDates(c, "", "", now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"2026-08-05", "2026-08-04"}
+		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+			t.Errorf("= %v, 預期 %v", got, want)
+		}
+	})
+
+	// 手動補資料時，使用者指定的範圍必須蓋過設定檔的 syncDays，
+	// 否則 -startDate/-endDate 在有 syncDays 的設定上會完全失效。
+	t.Run("手動日期優先於 syncDays", func(t *testing.T) {
+		c := validConfig()
+		c.SyncDays = 2
+		got, err := syncDates(c, "2026-07-01", "2026-07-03", now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"2026-07-03", "2026-07-02", "2026-07-01"}
+		if len(got) != len(want) {
+			t.Fatalf("= %v, 預期 %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("[%d] = %s, 預期 %s", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("只給單邊日期時仍走 syncDays", func(t *testing.T) {
+		c := validConfig()
+		c.SyncDays = 1
+		got, err := syncDates(c, "2026-07-01", "", now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0] != "2026-08-05" {
+			t.Errorf("= %v, 預期 [2026-08-05]", got)
+		}
+	})
+
+	t.Run("無效的手動日期回傳錯誤", func(t *testing.T) {
+		if _, err := syncDates(validConfig(), "bogus", "2026-07-03", now); err == nil {
+			t.Error("預期回傳錯誤")
+		}
+	})
+}
+
+func TestScheduleInterval(t *testing.T) {
+	now := time.Date(2026, 8, 5, 9, 17, 0, 0, time.Local)
+
+	tests := []struct {
+		expr string
+		want time.Duration
+	}{
+		{"0 * * * *", time.Hour},
+		{"*/15 * * * *", 15 * time.Minute},
+		{"30 2 * * *", 24 * time.Hour},
+		{"@every 30m", 30 * time.Minute},
+		{"@daily", 24 * time.Hour},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.expr, func(t *testing.T) {
+			sched, err := cron.ParseStandard(tc.expr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := scheduleInterval(sched, now); got != tc.want {
+				t.Errorf("= %v, 預期 %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStaggerDelay(t *testing.T) {
+	t.Run("同一把 key 每次都得到相同延遲", func(t *testing.T) {
+		// 用雜湊而非亂數，重啟後的行為才可預期
+		first := staggerDelay("host-a|/r|/l", time.Hour)
+		for i := 0; i < 10; i++ {
+			if got := staggerDelay("host-a|/r|/l", time.Hour); got != first {
+				t.Fatalf("第 %d 次 = %v, 預期 %v", i, got, first)
+			}
+		}
+	})
+
+	t.Run("不超過 maxStaggerDelay", func(t *testing.T) {
+		for i := 0; i < 200; i++ {
+			key := "host-" + strconv.Itoa(i) + "|/data/remote|/data/local"
+			got := staggerDelay(key, time.Hour)
+			if got < 0 || got >= maxStaggerDelay {
+				t.Fatalf("%s 的延遲 %v 超出 [0, %v)", key, got, maxStaggerDelay)
+			}
+		}
+	})
+
+	// 高頻排程若延遲整整 5 分鐘，每一輪都會被 SkipIfStillRunning 擋掉，
+	// 等於整個任務靜默停擺 —— 因此上限必須跟著間隔縮小。
+	t.Run("延遲不超過排程間隔的一半", func(t *testing.T) {
+		const interval = 30 * time.Second
+		for i := 0; i < 200; i++ {
+			got := staggerDelay("host-"+strconv.Itoa(i), interval)
+			if got < 0 || got >= interval/2 {
+				t.Fatalf("延遲 %v 超出 [0, %v)", got, interval/2)
+			}
+		}
+	})
+
+	t.Run("間隔無法判斷時仍以 maxStaggerDelay 為上限", func(t *testing.T) {
+		got := staggerDelay("host-a", 0)
+		if got < 0 || got >= maxStaggerDelay {
+			t.Errorf("延遲 %v 超出 [0, %v)", got, maxStaggerDelay)
+		}
+	})
+
+	t.Run("間隔極短時不做錯開", func(t *testing.T) {
+		if got := staggerDelay("host-a", time.Nanosecond); got != 0 {
+			t.Errorf("= %v, 預期 0", got)
+		}
+	})
+
+	// 錯開的目的就是把撞在同一時間點的任務攤開，
+	// 若大量設定都拿到同一個延遲就完全沒有效果。
+	t.Run("不同設定會分散到不同時間點", func(t *testing.T) {
+		seen := make(map[time.Duration]bool)
+		for i := 0; i < 24; i++ {
+			c := Config{SSHHost: "server-" + strconv.Itoa(i), RemoteDir: "/data", LocalDir: "/local"}
+			seen[staggerDelay(c.staggerKey(), time.Hour).Truncate(time.Second)] = true
+		}
+		if len(seen) < 20 {
+			t.Errorf("24 筆設定只分散到 %d 個時間點，錯開效果不足", len(seen))
+		}
+	})
+
+	t.Run("同一主機的不同目錄也會錯開", func(t *testing.T) {
+		a := Config{SSHHost: "h", RemoteDir: "/data/one", LocalDir: "/local"}
+		b := Config{SSHHost: "h", RemoteDir: "/data/two", LocalDir: "/local"}
+		if staggerDelay(a.staggerKey(), time.Hour) == staggerDelay(b.staggerKey(), time.Hour) {
+			t.Error("同一主機的兩筆設定拿到相同延遲")
+		}
+	})
+}
+
+func TestSleepCtx(t *testing.T) {
+	t.Run("等滿後回傳 true", func(t *testing.T) {
+		if !sleepCtx(context.Background(), time.Millisecond) {
+			t.Error("= false, 預期 true")
+		}
+	})
+
+	t.Run("延遲為 0 時直接返回", func(t *testing.T) {
+		start := time.Now()
+		if !sleepCtx(context.Background(), 0) {
+			t.Error("= false, 預期 true")
+		}
+		if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+			t.Errorf("耗時 %v，不應有等待", elapsed)
+		}
+	})
+
+	// 服務關閉時不該為了一個還沒開始的排程再等上幾分鐘
+	t.Run("ctx 取消時立刻返回 false", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		start := time.Now()
+		if sleepCtx(ctx, time.Hour) {
+			t.Error("= true, 預期 false")
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Errorf("耗時 %v，應立刻返回", elapsed)
+		}
+	})
+
+	t.Run("已取消的 ctx 搭配 0 延遲回傳 false", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if sleepCtx(ctx, 0) {
+			t.Error("= true, 預期 false")
+		}
+	})
+}
+
+// withGlobalTransferSem 在測試期間換掉全域號誌，結束後還原。
+func withGlobalTransferSem(t *testing.T, size int) {
+	t.Helper()
+	original := globalTransferSem
+	globalTransferSem = make(chan struct{}, size)
+	t.Cleanup(func() { globalTransferSem = original })
+}
+
+func TestTransferLimiter(t *testing.T) {
+	// 全域上限的意義：二十幾台主機的排程若撞在一起，總併發不能是
+	// 任務數 × maxConcurrentTransfers，否則網路與磁碟會被打滿。
+	t.Run("全域上限會擋住跨任務的併發", func(t *testing.T) {
+		withGlobalTransferSem(t, 2)
+		ctx := context.Background()
+
+		// 兩個獨立任務各取一個名額，正好用滿全域上限
+		a, b := newTransferLimiter(), newTransferLimiter()
+		if err := a.acquire(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.acquire(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		// 第三個任務即使自己的名額還很空，也必須排隊
+		c := newTransferLimiter()
+		blocked := make(chan error, 1)
+		go func() { blocked <- c.acquire(ctx) }()
+
+		select {
+		case err := <-blocked:
+			t.Fatalf("全域上限已滿卻仍取得名額 (err=%v)", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		// 有人歸還後才輪得到
+		a.release()
+		select {
+		case err := <-blocked:
+			if err != nil {
+				t.Fatalf("非預期錯誤: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("名額已歸還卻仍取不到")
+		}
+
+		b.release()
+		c.release()
+	})
+
+	t.Run("單一任務仍受 maxConcurrentTransfers 限制", func(t *testing.T) {
+		withGlobalTransferSem(t, maxConcurrentTransfers*4)
+		ctx := context.Background()
+
+		lim := newTransferLimiter()
+		for i := 0; i < maxConcurrentTransfers; i++ {
+			if err := lim.acquire(ctx); err != nil {
+				t.Fatalf("第 %d 次取號失敗: %v", i, err)
+			}
+		}
+
+		blocked := make(chan error, 1)
+		go func() { blocked <- lim.acquire(ctx) }()
+		select {
+		case err := <-blocked:
+			t.Fatalf("超出單一任務上限卻仍取得名額 (err=%v)", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		lim.release()
+		if err := <-blocked; err != nil {
+			t.Fatalf("非預期錯誤: %v", err)
+		}
+	})
+
+	t.Run("取消時不會卡住", func(t *testing.T) {
+		withGlobalTransferSem(t, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+
+		lim := newTransferLimiter()
+		if err := lim.acquire(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		other := newTransferLimiter()
+		done := make(chan error, 1)
+		go func() { done <- other.acquire(ctx) }()
+
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("錯誤 = %v, 預期 context.Canceled", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("取消後仍卡在號誌上")
+		}
+	})
+
+	// 取到 task 名額後才因取消而拿不到 global 時，
+	// 若忘了把 task 名額還回去，該任務的可用名額會永久少一個。
+	t.Run("全域取號失敗時歸還任務名額", func(t *testing.T) {
+		withGlobalTransferSem(t, 1)
+
+		blocker := newTransferLimiter()
+		if err := blocker.acquire(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		lim := newTransferLimiter()
+		if err := lim.acquire(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("錯誤 = %v, 預期 context.Canceled", err)
+		}
+		if n := len(lim.task); n != 0 {
+			t.Errorf("任務名額殘留 %d 個，應已歸還", n)
 		}
 	})
 }
